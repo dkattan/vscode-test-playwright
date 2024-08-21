@@ -1,0 +1,27 @@
+{
+  "name": "vscode-test-playwright-fixtures",
+  "displayName": "vscode-test-playwright fixtures",
+  "description": "Test extension used by vscode-test-playwright integration tests.",
+  "version": "0.0.1",
+  "publisher": "vscode-test-playwright",
+  "engines": {
+    "vscode": "^1.82.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onCommand:example.helloWorld",
+    "onCommand:example.showView"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "example.helloWorld",
+        "title": "Example: Hello World"
+      },
+      {
+        "command": "example.showView",
+        "title": "Example: Show View"
+      }
+    ]
+  }
+}
