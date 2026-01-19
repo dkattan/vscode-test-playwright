@@ -26,217 +26,22 @@ import {
 } from "./vscodeHandle";
 export { expect } from "@playwright/test";
 
-function resolveDefaultVSCodeUserDataDir(): string {
-  // VS Code default user data locations.
-  // We only implement the stable channel paths here. If you use Insiders or a
-  // non-default profile, override via PW_VSCODE_CLONE_USER_DATA_FROM and/or
-  // PW_VSCODE_PROFILE.
-  const home = os.homedir();
-  switch (os.platform()) {
-    case "darwin":
-      return path.join(home, "Library", "Application Support", "Code");
-    case "win32": {
-      const appData = process.env.APPDATA;
-      if (!appData) {
-        throw new Error(
-          "APPDATA is not set; cannot resolve default VS Code user data dir on Windows. "
-          + "Set PW_VSCODE_CLONE_USER_DATA_FROM to an explicit path.",
-        );
-      }
-      return path.join(appData, "Code");
-    }
-    case "linux":
-      return path.join(home, ".config", "Code");
-    default:
-      throw new Error(
-        `Unsupported platform '${os.platform()}' for default user data dir resolution. `
-        + "Set PW_VSCODE_CLONE_USER_DATA_FROM to an explicit path.",
-      );
-  }
-}
-
-function resolveDefaultVSCodeExtensionsDir(): string {
-  // Default VS Code extension install locations.
-  const home = os.homedir();
-  switch (os.platform()) {
-    case "darwin":
-    case "linux":
-      return path.join(home, ".vscode", "extensions");
-    case "win32":
-      return path.join(home, ".vscode", "extensions");
-    default:
-      throw new Error(
-        `Unsupported platform '${os.platform()}' for default extensions dir resolution. `
-        + "Set PW_VSCODE_EXTENSIONS_DIR to an explicit path.",
-      );
-  }
-}
-
-function resolveExtensionsDirOverride(cachePath: string): string {
-  const explicit = (process.env.PW_VSCODE_EXTENSIONS_DIR ?? "").trim();
-  if (explicit) {
-    return explicit;
-  }
-
-  const useDefault = (process.env.PW_VSCODE_USE_DEFAULT_EXTENSIONS_DIR ?? "").trim();
-  if (useDefault === "1" || useDefault.toLowerCase() === "true") {
-    return resolveDefaultVSCodeExtensionsDir();
-  }
-
-  return path.join(cachePath, "extensions");
-}
-
-async function cloneUserDataDir(
-  sourceUserDataDir: string,
-  targetUserDataDir: string,
-  cloneMode: string
-): Promise<void> {
-  // Clone the user's VS Code profile into an isolated directory.
-  //
-  // Why: When VS Code is already running, reusing the default user-data dir can
-  // cause a singleton handoff (the spawned Electron process exits quickly).
-  // Cloning preserves auth state (Copilot/GitHub) while ensuring Playwright gets
-  // a dedicated --user-data-dir.
-  console.log(
-    `[vscode-test-playwright] Cloning VS Code user data (mode=${cloneMode}) from '${sourceUserDataDir}' -> '${targetUserDataDir}'`,
-  );
-  await fs.promises.mkdir(targetUserDataDir, { recursive: true });
-
-  if (cloneMode === "full") {
-    // Copy everything.
-    await fs.promises.cp(sourceUserDataDir, targetUserDataDir, {
-      recursive: true,
-      errorOnExist: false,
-      force: true,
-    });
-    return;
-  }
-
-  // Minimal clone: copy machine identity plus a narrow allowlist of VS Code state.
-  //
-  // IMPORTANT: Many users accumulate multi-GB extension caches under User/globalStorage
-  // (e.g. other AI extensions). Copying the entire User folder can look like a “hang”.
-  // For this repo's demo we only need Copilot/Chat state.
-  const rootFilesToCopy = ["machineid", "storage.json"];
-  for (const f of rootFilesToCopy) {
-    const src = path.join(sourceUserDataDir, f);
-    const dst = path.join(targetUserDataDir, f);
-    if (fs.existsSync(src)) {
-      await fs.promises.cp(src, dst, { force: true });
-    }
-  }
-
-  const srcUserDir = path.join(sourceUserDataDir, "User");
-  if (!fs.existsSync(srcUserDir)) {
-    throw new Error(
-      `PW_VSCODE_CLONE_USER_DATA_FROM resolved to '${sourceUserDataDir}', but it has no 'User' directory.`,
-    );
-  }
-
-  const dstUserDir = path.join(targetUserDataDir, "User");
-  await fs.promises.mkdir(dstUserDir, { recursive: true });
-
-  // Copy only selected globalStorage entries.
-  const srcGlobalStorage = path.join(srcUserDir, "globalStorage");
-  const dstGlobalStorage = path.join(dstUserDir, "globalStorage");
-  if (fs.existsSync(srcGlobalStorage)) {
-    const allowTopLevel = new Set([
-      // VS Code global storage db + metadata
-      "state.vscdb",
-      "state.vscdb.backup",
-      "storage.json",
-      // Copilot / chat state
-      "github.copilot",
-      "github.copilot-chat",
-      // VS Code chat session persistence (helps avoid first-run prompts)
-      "emptyWindowChatSessions",
-      // If this repo's Azure Copilot tooling is installed, keep its state too.
-      "ms-azuretools.vscode-azure-github-copilot",
-    ]);
-
-    await fs.promises.cp(srcGlobalStorage, dstGlobalStorage, {
-      recursive: true,
-      errorOnExist: false,
-      force: true,
-      filter: (src: string) => {
-        const rel = path.relative(srcGlobalStorage, src);
-        if (!rel || rel === ".") {
-          return true;
-        }
-        const first = rel.split(path.sep)[0];
-        return allowTopLevel.has(first);
-      },
-    } as any);
-  }
-
-  // Copy a couple of small, frequently-used user settings files (optional).
-  const userFilesToCopy = ["settings.json", "keybindings.json", "argv.json"];
-  for (const f of userFilesToCopy) {
-    const src = path.join(srcUserDir, f);
-    const dst = path.join(dstUserDir, f);
-    if (fs.existsSync(src)) {
-      await fs.promises.cp(src, dst, { force: true });
-    }
-  }
-
-  console.log("[vscode-test-playwright] Finished cloning VS Code user data.");
-}
-
-function resolveVsCodeExecutablePathOverride(): string | undefined {
-  const raw = process.env.PW_VSCODE_EXECUTABLE_PATH;
-  if (!raw) {
-    return undefined;
-  }
-  const p = raw.trim();
-  if (!p) {
-    return undefined;
-  }
-
-  // On macOS, allow passing either the .app bundle OR the inner binary.
-  // Playwright's Electron launcher needs an executable file.
-  if (os.platform() === "darwin") {
-    const appBundleSuffix = ".app";
-    if (p.endsWith(appBundleSuffix) && fs.existsSync(p) && fs.lstatSync(p).isDirectory()) {
-      const inner = path.join(p, "Contents", "MacOS", "Electron");
-      if (!fs.existsSync(inner)) {
-        throw new Error(
-          `PW_VSCODE_EXECUTABLE_PATH points at '${p}', but '${inner}' does not exist. `
-          + "Set PW_VSCODE_EXECUTABLE_PATH to the inner executable or install VS Code normally.",
-        );
-      }
-      return inner;
-    }
-  }
-
-  return p;
-}
-
-function resolveCloneSourceFromEnv(): string | undefined {
-  const raw = process.env.PW_VSCODE_CLONE_USER_DATA_FROM;
-  if (!raw) {
-    return undefined;
-  }
-  const v = raw.trim();
-  if (!v) {
-    return undefined;
-  }
-  if (v === "default") {
-    return resolveDefaultVSCodeUserDataDir();
-  }
-  return v;
-}
-
-function resolveProfileArgFromEnv(): string | undefined {
-  const raw = process.env.PW_VSCODE_PROFILE;
-  if (!raw) {
-    return undefined;
-  }
-  const v = raw.trim();
-  return v ? v : undefined;
-}
-
 export type VSCodeWorkerOptions = {
   vscodeVersion: string;
+  /**
+   * Optional explicit VS Code install/executable path to launch instead of downloading
+   * via @vscode/test-electron.
+   *
+   * This is primarily useful for Playwright demo/recording runs that need the
+   * machine's existing signed-in state (GitHub/Copilot), which typically lives
+   * in the user's normal VS Code profile.
+   *
+   * Examples (macOS):
+   * - /Applications/Visual Studio Code.app
+   * - /Applications/Visual Studio Code.app/Contents/MacOS/Electron
+   * - /Applications/Visual Studio Code Insiders.app
+   */
+  vscodeExecutablePath?: string;
   extensions?: string | string[];
   vscodeTrace:
     | TraceMode
@@ -249,6 +54,24 @@ export type VSCodeWorkerOptions = {
       };
   extensionsDir?: string;
   userDataDir?: string;
+  /**
+   * Optional VS Code profile name to use when launching.
+   *
+   * This is useful when your GitHub/Copilot auth lives in a non-default VS Code
+   * profile (VS Code Profiles feature). In that case, launching without an
+   * explicit profile can appear “not signed in” even though your normal VS Code
+   * window is.
+   *
+   * Can also be set via env var: PW_VSCODE_PROFILE
+   */
+  vscodeProfile?: string;
+  /**
+   * If set (via fixture option or env), copy an existing VS Code user data dir
+   * into a per-run temp directory and launch with --user-data-dir pointing at
+   * that clone. This avoids VS Code single-instance handoff (which would make
+   * the spawned Electron process exit immediately) while retaining sign-in state.
+   */
+  cloneUserDataDirFrom?: string;
 };
 
 export type VSCodeTestOptions = {
@@ -323,6 +146,469 @@ function getTraceMode(
   return traceMode;
 }
 
+function shouldSkipUserDataEntry(entryName: string) {
+  // These directories are large and not required for auth state.
+  // Skipping them dramatically speeds up "clone user data" startup.
+  // NOTE: We do NOT skip User/, User/globalStorage/, User/workspaceStorage/.
+  const skipNames = new Set([
+    "Cache",
+    "Code Cache",
+    "GPUCache",
+    "CachedData",
+    "logs",
+    "Crashpad",
+    "CrashpadMetrics-active.pma",
+  ]);
+  return skipNames.has(entryName);
+}
+
+type CloneMode = "full" | "minimal";
+
+function getCloneMode(): CloneMode {
+  const mode = (process.env.PW_VSCODE_CLONE_MODE ?? "full").toLowerCase();
+  if (mode === "minimal") return "minimal";
+  return "full";
+}
+
+function getCloneExcludePaths(): string[] {
+  // Comma-separated list of user-data relative paths to exclude from cloning.
+  // Examples:
+  // - User/workspaceStorage
+  // - User/globalStorage/github.copilot-chat
+  // - User/storage.json
+  const raw = process.env.PW_VSCODE_CLONE_EXCLUDE_PATHS;
+  if (!raw) return [];
+
+  const parsed = raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => s.replace(/\\/g, "/"));
+
+  const normalized: string[] = [];
+  for (const p of parsed) {
+    if (path.isAbsolute(p)) {
+      throw new Error(
+        `PW_VSCODE_CLONE_EXCLUDE_PATHS entries must be relative to the VS Code user data dir. Got absolute path: ${p}`
+      );
+    }
+    const n = path.posix.normalize(p);
+    if (n === "." || n === "") {
+      throw new Error(
+        `PW_VSCODE_CLONE_EXCLUDE_PATHS entries must not be empty. Got: ${JSON.stringify(
+          p
+        )}`
+      );
+    }
+    const parts = n.split("/");
+    if (parts.some((seg) => seg === "..")) {
+      throw new Error(
+        `PW_VSCODE_CLONE_EXCLUDE_PATHS entries must not contain '..'. Got: ${p}`
+      );
+    }
+    normalized.push(n);
+  }
+  return normalized;
+}
+
+function shouldExcludeRelativePath(
+  relativePosixPath: string,
+  excludePaths: string[]
+): boolean {
+  if (!excludePaths.length) return false;
+  const rel = path.posix.normalize(relativePosixPath.replace(/\\/g, "/"));
+  return excludePaths.some((ex) => rel === ex || rel.startsWith(`${ex}/`));
+}
+
+function shouldIncludeGlobalStorageInClone(): boolean {
+  // User/globalStorage contains extension global state. This is often where auth/session
+  // context is persisted for extensions like Copilot and GitHub Pull Requests.
+  //
+  // For experimentation, allow opting out.
+  // Set PW_VSCODE_CLONE_INCLUDE_GLOBAL_STORAGE=0 to skip copying User/globalStorage.
+  const raw = (
+    process.env.PW_VSCODE_CLONE_INCLUDE_GLOBAL_STORAGE ?? "1"
+  ).trim();
+  return raw !== "0";
+}
+
+function getGlobalStorageAllowlist(): string[] {
+  // Comma-separated extension ids.
+  // Example: github.copilot-chat,github.copilot
+  const raw = process.env.PW_VSCODE_CLONE_GLOBAL_STORAGE_ALLOWLIST;
+  if (!raw) {
+    return ["github.copilot", "github.copilot-chat"];
+  }
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+async function sanitizeClonedUserDataDir(userDataDir: string) {
+  // When reusing cached clones, stale socket/lock artifacts can break startup.
+  // Example: connect ENOTSOCK <...>/1.10-main.sock
+  const rootNamesToRemove = new Set([
+    "SingletonLock",
+    "SingletonCookie",
+    "SingletonSocket",
+    "lockfile",
+  ]);
+
+  // Fast-path: VS Code places its IPC artifacts at the root of the user data dir.
+  // If these exist but are not sockets (e.g. after a crash/copy), startup can fail
+  // with ENOTSOCK before Playwright can attach.
+  try {
+    const entries = await fs.promises.readdir(userDataDir, {
+      withFileTypes: true,
+    });
+    await Promise.all(
+      entries.map(async (e) => {
+        const shouldRemove =
+          rootNamesToRemove.has(e.name) ||
+          e.name.endsWith(".sock") ||
+          e.name.endsWith(".sock.lock");
+        if (!shouldRemove) return;
+        try {
+          await fs.promises.rm(path.join(userDataDir, e.name), {
+            force: true,
+            recursive: e.isDirectory(),
+          });
+        } catch {
+          // Ignore per-entry failures; startup will surface remaining issues.
+        }
+      })
+    );
+  } catch {
+    // Ignore root sanitize failures; proceed with best-effort.
+  }
+
+  // Best-effort deeper cleanup: remove matching files/sockets anywhere under the clone.
+  // This is intentionally lenient: permission errors can occur in copied state, but
+  // removing what we can is still better than giving up.
+  const patterns = ["*.sock", "*.sock.lock", ...Array.from(rootNamesToRemove)];
+  for (const p of patterns) {
+    try {
+      // Use native globbing via find to avoid bringing in extra deps.
+      const res = cp.spawnSync(
+        "find",
+        [
+          userDataDir,
+          "(",
+          "-type",
+          "f",
+          "-o",
+          "-type",
+          "s",
+          ")",
+          "-name",
+          p,
+          "-print",
+        ],
+        { encoding: "utf8" }
+      );
+      if (!res.stdout) continue;
+      const files = res.stdout
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      for (const f of files) {
+        try {
+          await fs.promises.rm(f, { force: true });
+        } catch {
+          // Ignore per-file failures; startup will surface remaining issues.
+        }
+      }
+    } catch {
+      // Ignore sanitize failures; startup will surface remaining issues.
+    }
+  }
+}
+
+async function copyVSCodeUserDataDir(
+  srcUserDataDir: string,
+  destUserDataDir: string,
+  logPrefix?: string
+) {
+  const mode = getCloneMode();
+  const allowlist = new Set(getGlobalStorageAllowlist());
+  const includeGlobalStorage = shouldIncludeGlobalStorageInClone();
+  const excludePaths = getCloneExcludePaths();
+
+  // VS Code user data layout (macOS stable):
+  // - User/ (settings, globalStorage, workspaceStorage)
+  // - CachedData/, logs/, etc.
+
+  if (mode === "full") {
+    await copyDirSkippingSpecialFiles(srcUserDataDir, destUserDataDir, {
+      rootSrcDir: srcUserDataDir,
+      excludePaths,
+      logPrefix,
+    });
+    return;
+  }
+
+  // minimal mode:
+  // - Copy User/ directory, but only allowlist subfolders within User/globalStorage
+  // - Skip bulky caches/logs/crash dirs (already handled by shouldSkipUserDataEntry)
+  const userSrc = path.join(srcUserDataDir, "User");
+  const userDest = path.join(destUserDataDir, "User");
+  await fs.promises.mkdir(userDest, { recursive: true });
+
+  // Copy everything in User/ except globalStorage directories (handled separately).
+  const userEntries = await fs.promises.readdir(userSrc, {
+    withFileTypes: true,
+  });
+  await Promise.all(
+    userEntries.map(async (entry) => {
+      if (entry.name === "globalStorage") return;
+      const srcPath = path.join(userSrc, entry.name);
+      const destPath = path.join(userDest, entry.name);
+
+      const rel = path.posix.join("User", entry.name);
+      if (shouldExcludeRelativePath(rel, excludePaths)) {
+        if (logPrefix) {
+          console.log(`${logPrefix} minimal clone: excluded '${rel}'`);
+        }
+        return;
+      }
+
+      if (entry.isDirectory()) {
+        await copyDirSkippingSpecialFiles(srcPath, destPath, {
+          rootSrcDir: srcUserDataDir,
+          excludePaths,
+          logPrefix,
+        });
+      } else if (entry.isSymbolicLink()) {
+        const link = await fs.promises.readlink(srcPath);
+        await fs.promises.symlink(link, destPath);
+      } else if (entry.isFile()) {
+        await fs.promises.copyFile(srcPath, destPath);
+      }
+    })
+  );
+
+  if (!includeGlobalStorage) {
+    // Keep the directory structure stable, but omit globalStorage content entirely.
+    // This can be useful to validate whether auth state truly requires globalStorage
+    // for a given environment.
+    await fs.promises.mkdir(path.join(userDest, "globalStorage"), {
+      recursive: true,
+    });
+    if (logPrefix) {
+      console.log(
+        `${logPrefix} minimal clone: skipping User/globalStorage (PW_VSCODE_CLONE_INCLUDE_GLOBAL_STORAGE=0)`
+      );
+    }
+    return;
+  }
+
+  // Now copy User/globalStorage, but only root files + allowlisted extension dirs.
+  const gsSrc = path.join(userSrc, "globalStorage");
+  const gsDest = path.join(userDest, "globalStorage");
+  await fs.promises.mkdir(gsDest, { recursive: true });
+  const gsEntries = await fs.promises.readdir(gsSrc, { withFileTypes: true });
+  await Promise.all(
+    gsEntries.map(async (entry) => {
+      const srcPath = path.join(gsSrc, entry.name);
+      const destPath = path.join(gsDest, entry.name);
+
+      const rel = path.posix.join("User", "globalStorage", entry.name);
+      if (shouldExcludeRelativePath(rel, excludePaths)) {
+        if (logPrefix) {
+          console.log(`${logPrefix} minimal clone: excluded '${rel}'`);
+        }
+        return;
+      }
+
+      if (entry.isDirectory()) {
+        if (!allowlist.has(entry.name)) return;
+        await copyDirSkippingSpecialFiles(srcPath, destPath, {
+          rootSrcDir: srcUserDataDir,
+          excludePaths,
+          logPrefix,
+        });
+        return;
+      }
+      if (entry.isSymbolicLink()) {
+        const link = await fs.promises.readlink(srcPath);
+        await fs.promises.symlink(link, destPath);
+        return;
+      }
+      if (entry.isFile()) {
+        await fs.promises.copyFile(srcPath, destPath);
+      }
+    })
+  );
+}
+
+async function copyDirSkippingSpecialFiles(
+  srcDir: string,
+  destDir: string,
+  opts: {
+    rootSrcDir: string;
+    excludePaths: string[];
+    logPrefix?: string;
+  }
+) {
+  const relFromRoot = path
+    .relative(opts.rootSrcDir, srcDir)
+    .replace(/\\/g, "/");
+  if (
+    relFromRoot &&
+    shouldExcludeRelativePath(
+      path.posix.normalize(relFromRoot),
+      opts.excludePaths
+    )
+  ) {
+    if (opts.logPrefix) {
+      console.log(`${opts.logPrefix} excluded dir '${relFromRoot}'`);
+    }
+    return;
+  }
+
+  const entries = await fs.promises.readdir(srcDir, { withFileTypes: true });
+  await fs.promises.mkdir(destDir, { recursive: true });
+
+  const t0 = Date.now();
+  let copiedFiles = 0;
+  let copiedDirs = 0;
+  await Promise.all(
+    entries.map(async (entry) => {
+      const srcPath = path.join(srcDir, entry.name);
+      const destPath = path.join(destDir, entry.name);
+
+      const rel = path.relative(opts.rootSrcDir, srcPath).replace(/\\/g, "/");
+      if (
+        rel &&
+        shouldExcludeRelativePath(path.posix.normalize(rel), opts.excludePaths)
+      ) {
+        if (opts.logPrefix) {
+          console.log(`${opts.logPrefix} excluded '${rel}'`);
+        }
+        return;
+      }
+
+      // Avoid copying VS Code's runtime socket/lock artifacts.
+      if (entry.name.endsWith(".sock")) return;
+
+      if (shouldSkipUserDataEntry(entry.name)) return;
+
+      if (entry.isDirectory()) {
+        copiedDirs++;
+        await copyDirSkippingSpecialFiles(srcPath, destPath, opts);
+        return;
+      }
+
+      if (entry.isSymbolicLink()) {
+        const link = await fs.promises.readlink(srcPath);
+        await fs.promises.symlink(link, destPath);
+        return;
+      }
+
+      if (entry.isFile()) {
+        await fs.promises.copyFile(srcPath, destPath);
+        copiedFiles++;
+        return;
+      }
+
+      // Skip sockets, FIFOs, devices, etc.
+    })
+  );
+
+  if (opts.logPrefix) {
+    const dtMs = Date.now() - t0;
+    // eslint-disable-next-line no-console
+    console.log(
+      `${opts.logPrefix} copied ${copiedFiles} file(s), ${copiedDirs} dir(s) from ${srcDir} in ${dtMs}ms`
+    );
+  }
+}
+
+function resolveCloneCacheDir(): string | undefined {
+  // Deprecated: clone caching removed. Always clone into a fresh temp directory.
+  return undefined;
+}
+
+function resolveDefaultVSCodeUserDataDir(explicitExecutablePath?: string) {
+  const isInsiders = /insiders/i.test(explicitExecutablePath ?? "");
+  const platform = os.platform();
+
+  if (platform === "darwin") {
+    // VS Code (stable): ~/Library/Application Support/Code
+    // VS Code Insiders: ~/Library/Application Support/Code - Insiders
+    return path.join(
+      os.homedir(),
+      "Library",
+      "Application Support",
+      isInsiders ? "Code - Insiders" : "Code"
+    );
+  }
+
+  if (platform === "win32") {
+    // VS Code (stable): %APPDATA%\Code
+    // VS Code Insiders: %APPDATA%\Code - Insiders
+    const appData = process.env.APPDATA;
+    if (!appData) {
+      throw new Error(
+        "PW_VSCODE_CLONE_USER_DATA_FROM=default requires APPDATA to be set on Windows."
+      );
+    }
+    return path.join(appData, isInsiders ? "Code - Insiders" : "Code");
+  }
+
+  // Linux
+  // VS Code (stable): ~/.config/Code
+  // VS Code Insiders: ~/.config/Code - Insiders
+  return path.join(
+    os.homedir(),
+    ".config",
+    isInsiders ? "Code - Insiders" : "Code"
+  );
+}
+
+function discoverVSCodeExecutablePath(): string | undefined {
+  // Opt-in only: auto-discovery is inherently heuristic and should not silently
+  // change CI behavior.
+  const enabled = process.env.PW_VSCODE_AUTO_DISCOVER === "1";
+  if (!enabled) return undefined;
+
+  if (os.platform() === "darwin") {
+    const candidates = [
+      "/Applications/Visual Studio Code.app",
+      "/Applications/Visual Studio Code Insiders.app",
+    ];
+    for (const c of candidates) {
+      if (fs.existsSync(c)) return c;
+    }
+  }
+
+  // Try PATH lookups (best effort). On macOS this typically returns a shim
+  // script, so we still prefer the .app path above.
+  const commands =
+    os.platform() === "win32"
+      ? ["code.cmd", "code"]
+      : ["code", "code-insiders"];
+  for (const cmd of commands) {
+    const res = cp.spawnSync(
+      os.platform() === "win32" ? "where" : "which",
+      [cmd],
+      {
+        encoding: "utf8",
+      }
+    );
+    if (res.status === 0 && typeof res.stdout === "string") {
+      const firstLine = res.stdout
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .find(Boolean);
+      if (firstLine) return firstLine;
+    }
+  }
+
+  return undefined;
+}
+
 // adapted from https://github.com/microsoft/playwright/blob/a6b320e36224f70ad04fd520503c230d5956ba66/packages/playwright-core/src/server/electron/electron.ts#L294-L320
 function waitForLine(
   process: cp.ChildProcess,
@@ -381,6 +667,9 @@ export const test = base.extend<
   VSCodeWorkerOptions & InternalWorkerFixtures
 >({
   vscodeVersion: ["insiders", { option: true, scope: "worker" }],
+  vscodeExecutablePath: [undefined, { option: true, scope: "worker" }],
+  vscodeProfile: [undefined, { option: true, scope: "worker" }],
+  cloneUserDataDirFrom: [undefined, { option: true, scope: "worker" }],
   extensions: [undefined, { option: true, scope: "worker" }],
   vscodeTrace: ["off", { option: true, scope: "worker" }],
   extensionDevelopmentPath: [undefined, { option: true }],
@@ -393,77 +682,117 @@ export const test = base.extend<
 
   _vscodeInstall: [
     async (
-      { _createTempDir, vscodeVersion, extensions, extensionsDir, userDataDir },
+      {
+        _createTempDir,
+        vscodeVersion,
+        vscodeExecutablePath,
+        extensions,
+        extensionsDir,
+        userDataDir,
+      },
       use,
       workerInfo
     ) => {
       const cachePath = await _createTempDir();
+
+      const explicitExecutablePath =
+        vscodeExecutablePath ??
+        process.env.PW_VSCODE_EXECUTABLE_PATH ??
+        discoverVSCodeExecutablePath();
+
+      // If the caller provided an explicit VS Code install/executable path,
+      // we use it directly (do not download a fresh build).
+      //
+      // IMPORTANT: We still create a worker-specific cachePath so that any
+      // harness artifacts (logs/attachments) have a stable place.
+      if (explicitExecutablePath) {
+        // Only attempt to install extensions when explicitly requested.
+        if (extensions) {
+          const [cliPath] = resolveCliArgsFromVSCodeExecutablePath(
+            explicitExecutablePath
+          );
+          await new Promise<void>((resolve, reject) => {
+            extensions =
+              typeof extensions === "string" ? [extensions] : extensions ?? [];
+            const subProcess = cp.spawn(
+              cliPath,
+              [
+                `--extensions-dir=${
+                  extensionsDir ?? path.join(cachePath, "extensions")
+                }`,
+                `--user-data-dir=${
+                  userDataDir ?? path.join(cachePath, "user-data")
+                }`,
+                ...extensions.flatMap((extension) => [
+                  "--install-extension",
+                  extension,
+                ]),
+              ],
+              {
+                stdio: "inherit",
+                shell: os.platform() === "win32",
+              }
+            );
+            subProcess.on("exit", (code, signal) => {
+              if (!code) resolve();
+              else
+                reject(
+                  new Error(
+                    `Failed to install extensions: code = ${code}, signal = ${signal}`
+                  )
+                );
+            });
+          });
+        }
+
+        await use({ installPath: explicitExecutablePath, cachePath });
+        return;
+      }
+
       const installBasePath = path.join(
         process.cwd(),
         ".vscode-test",
         `worker-${workerInfo.parallelIndex}`
       );
       await fs.promises.mkdir(installBasePath, { recursive: true });
-      const executableOverride = resolveVsCodeExecutablePathOverride();
-      const installPath =
-        executableOverride ??
-        (await downloadAndUnzipVSCode({
-          cachePath: installBasePath,
-          version: vscodeVersion,
-        }));
+      const installPath = await downloadAndUnzipVSCode({
+        cachePath: installBasePath,
+        version: vscodeVersion,
+      });
       const [cliPath] = resolveCliArgsFromVSCodeExecutablePath(installPath);
 
       if (extensions) {
         await new Promise<void>((resolve, reject) => {
-          const extensionsList =
-            typeof extensions === "string" ? [extensions] : extensions;
-
-          // Allow env-driven user-data cloning for installs that require auth state.
-          // (Primarily used by demo flows; normal tests can omit these env vars.)
-          const cloneFrom = resolveCloneSourceFromEnv();
-          const cloneMode = (process.env.PW_VSCODE_CLONE_MODE ?? "minimal").trim();
-          const resolvedUserDataDir =
-            userDataDir ?? (cloneFrom ? path.join(cachePath, "user-data-clone") : undefined);
-          const resolvedExtensionsDir =
-            extensionsDir ?? resolveExtensionsDirOverride(cachePath);
-
-          const doInstall = async () => {
-            try {
-              if (cloneFrom && resolvedUserDataDir) {
-                await cloneUserDataDir(cloneFrom, resolvedUserDataDir, cloneMode);
-              }
-
-              const subProcess = cp.spawn(
-                cliPath,
-                [
-                  `--extensions-dir=${resolvedExtensionsDir}`,
-                  `--user-data-dir=${resolvedUserDataDir ?? path.join(cachePath, "user-data")}`,
-                  ...(extensionsList ?? []).flatMap((extension: string) => [
-                    "--install-extension",
-                    extension,
-                  ]),
-                ],
-                {
-                  stdio: "inherit",
-                  shell: os.platform() === "win32",
-                }
+          extensions =
+            typeof extensions === "string" ? [extensions] : extensions ?? [];
+          const subProcess = cp.spawn(
+            cliPath,
+            [
+              `--extensions-dir=${
+                extensionsDir ?? path.join(cachePath, "extensions")
+              }`,
+              `--user-data-dir=${
+                userDataDir ?? path.join(cachePath, "user-data")
+              }`,
+              ...extensions.flatMap((extension) => [
+                "--install-extension",
+                extension,
+              ]),
+            ],
+            {
+              stdio: "inherit",
+              shell: os.platform() === "win32",
+            }
+          );
+          subProcess.on("exit", (code, signal) => {
+            if (!code) resolve();
+            else
+              reject(
+                new Error(
+                  `Failed to install extensions: code = ${code}, signal = ${signal}`
+                )
               );
-              subProcess.on("exit", (code, signal) => {
-                if (!code) resolve();
-                else
-                  reject(
-                    new Error(
-                      `Failed to install extensions: code = ${code}, signal = ${signal}`
-                    )
-                  );
-              });
-            }
-            catch (e) {
-              reject(e);
-            }
-          };
-
-          void doInstall();
+          });
         });
       }
 
@@ -481,6 +810,9 @@ export const test = base.extend<
         _vscodeInstall,
         vscodeTrace,
         trace,
+        extensions,
+        vscodeProfile,
+        cloneUserDataDirFrom,
         extensionsDir,
         userDataDir,
       },
@@ -489,20 +821,86 @@ export const test = base.extend<
     ) => {
       const { installPath, cachePath } = _vscodeInstall;
 
-      const resolvedExtensionsDir =
-        extensionsDir ?? resolveExtensionsDirOverride(cachePath);
+      const effectiveProfile = vscodeProfile ?? process.env.PW_VSCODE_PROFILE;
 
-      // Env-driven user data cloning. This is used by this repo's demo flow
-      // to launch VS Code already authenticated to Copilot/GitHub.
-      const cloneFrom = resolveCloneSourceFromEnv();
-      const cloneMode = (process.env.PW_VSCODE_CLONE_MODE ?? "minimal").trim();
-      const resolvedUserDataDir =
-        userDataDir ?? (cloneFrom ? path.join(cachePath, "user-data-clone") : undefined);
-      if (cloneFrom && resolvedUserDataDir) {
-        await cloneUserDataDir(cloneFrom, resolvedUserDataDir, cloneMode);
+      // For demo/recording runs, you can clone an existing signed-in profile into
+      // this run's temp directory. This both:
+      // 1) avoids VS Code single-instance handoff, and
+      // 2) preserves auth state so Copilot/GitHub can be available.
+      const cloneFromRaw =
+        cloneUserDataDirFrom ?? process.env.PW_VSCODE_CLONE_USER_DATA_FROM;
+      const cloneFrom =
+        cloneFromRaw === "default"
+          ? resolveDefaultVSCodeUserDataDir(installPath)
+          : cloneFromRaw;
+
+      // Always clone into a fresh directory for each run to avoid state bleed
+      // and to make it easier to iteratively narrow the minimal set of files
+      // required for sign-in behavior.
+      const clonedUserDataDir = cloneFrom
+        ? path.join(cachePath, "user-data")
+        : undefined;
+      if (cloneFrom) {
+        if (!fs.existsSync(cloneFrom)) {
+          throw new Error(
+            `PW_VSCODE_CLONE_USER_DATA_FROM path does not exist: ${cloneFrom}`
+          );
+        }
+
+        const logPrefix = "[pw-vscode]";
+        // eslint-disable-next-line no-console
+        console.log(
+          `${logPrefix} cloning user data from '${cloneFrom}' to '${clonedUserDataDir}'`
+        );
+
+        const t0 = Date.now();
+        await fs.promises.mkdir(clonedUserDataDir!, { recursive: true });
+        // Copy can be large; keep it simple and explicit.
+        // We can't rely on fs.cp because VS Code profiles can include socket files.
+        await copyVSCodeUserDataDir(cloneFrom, clonedUserDataDir!, logPrefix);
+        // eslint-disable-next-line no-console
+        console.log(
+          `${logPrefix} clone completed in ${
+            Date.now() - t0
+          }ms (dest='${clonedUserDataDir}')`
+        );
+
+        // Always sanitize cloned user data.
+        await sanitizeClonedUserDataDir(clonedUserDataDir!);
       }
 
-      const profileArg = resolveProfileArgFromEnv();
+      const effectiveUserDataDir = userDataDir ?? clonedUserDataDir;
+
+      // Playwright's Electron launcher needs the actual executable.
+      // On macOS, @vscode/test-electron provides an install directory containing
+      // `Visual Studio Code.app`, so we must point at `.../Contents/MacOS/Electron`.
+      let electronExecutablePath = installPath;
+      if (os.platform() === "darwin") {
+        // Some versions return the Electron binary directly.
+        if (fs.existsSync(installPath)) {
+          const stat = fs.statSync(installPath);
+          if (stat.isFile() && path.basename(installPath) === "Electron") {
+            electronExecutablePath = installPath;
+          } else {
+            const appBundlePath = installPath.endsWith(".app")
+              ? installPath
+              : path.join(installPath, "Visual Studio Code.app");
+            const candidate = path.join(
+              appBundlePath,
+              "Contents",
+              "MacOS",
+              "Electron"
+            );
+            if (!fs.existsSync(candidate)) {
+              throw new Error(
+                `VS Code Electron executable not found at expected path: ${candidate}. ` +
+                  `Resolved installPath: ${installPath}`
+              );
+            }
+            electronExecutablePath = candidate;
+          }
+        }
+      }
 
       // remove all VSCODE_* environment variables, otherwise it fails to load custom webviews with the following error:
       // InvalidStateError: Failed to register a ServiceWorker: The document is in an invalid state
@@ -511,12 +909,8 @@ export const test = base.extend<
         if (/^VSCODE_/i.test(prop)) delete env[prop];
       }
 
-      // If the caller explicitly provides an executable path, prefer it.
-      // (Used for demo runs where the system-installed VS Code is already signed in.)
-      const executableOverride = resolveVsCodeExecutablePathOverride();
-
       const electronApp = await _electron.launch({
-        executablePath: executableOverride ?? installPath,
+        executablePath: electronExecutablePath,
         env,
         args: [
           // Stolen from https://github.com/microsoft/vscode-test/blob/0ec222ef170e102244569064a12898fb203e5bb7/lib/runTest.ts#L126-L160
@@ -529,20 +923,46 @@ export const test = base.extend<
           "--skip-welcome",
           "--skip-release-notes",
           "--disable-workspace-trust",
-          `--extensions-dir=${
-            resolvedExtensionsDir
-          }`,
-          `--user-data-dir=${
-            resolvedUserDataDir ?? path.join(cachePath, "user-data")
-          }`,
-          ...(profileArg ? [`--profile=${profileArg}`] : []),
-          `--extensionTestsPath=${path.join(__dirname, "injected", "index")}`,
+          ...(effectiveProfile ? ["--profile", effectiveProfile] : []),
+          // Only pin dirs when the caller explicitly asked for them OR when we
+          // installed extensions into a temp dir for this run.
+          ...(extensions || extensionsDir
+            ? [
+                `--extensions-dir=${
+                  extensionsDir ?? path.join(cachePath, "extensions")
+                }`,
+              ]
+            : []),
+          ...(effectiveUserDataDir
+            ? [`--user-data-dir=${effectiveUserDataDir}`]
+            : []),
+          // `--extensionTestsPath=${path.join(__dirname, "injected", "index")}`,
           ...(extensionDevelopmentPath
             ? [`--extensionDevelopmentPath=${extensionDevelopmentPath}`]
             : []),
           baseDir,
         ],
       });
+
+      // Capture early process output to aid debugging when VS Code exits before firstWindow() is ready.
+      const outputLineLimit = 2000;
+      const stdoutLines: string[] = [];
+      const stderrLines: string[] = [];
+      const pushLines = (target: string[], chunk: Buffer) => {
+        const text = chunk.toString("utf8");
+        for (const line of text.split(/\r?\n/)) {
+          if (!line) continue;
+          target.push(line);
+          if (target.length > outputLineLimit)
+            target.splice(0, target.length - outputLineLimit);
+        }
+      };
+
+      const childProcess = electronApp.process();
+      const onStdout = (b: Buffer) => pushLines(stdoutLines, b);
+      const onStderr = (b: Buffer) => pushLines(stderrLines, b);
+      childProcess?.stdout?.on("data", onStdout);
+      childProcess?.stderr?.on("data", onStderr);
 
       const traceMode = getTraceMode(vscodeTrace);
       const captureTrace = shouldCaptureTrace(traceMode, testInfo);
@@ -581,12 +1001,79 @@ export const test = base.extend<
         }
       }
 
-      await electronApp.close();
+      // If VS Code crashes/exits early, closing the Electron application can throw.
+      // We still want to copy whatever logs exist to the test output for diagnosis.
+      let closeError: unknown;
+      try {
+        await electronApp.close();
+      } catch (e) {
+        closeError = e;
+      }
+
+      // Detach listeners and attach captured output for diagnostics.
+      try {
+        childProcess?.stdout?.off("data", onStdout);
+        childProcess?.stderr?.off("data", onStderr);
+      } catch {
+        // Ignore listener cleanup errors.
+      }
+
+      if (stdoutLines.length) {
+        try {
+          const outPath = testInfo.outputPath("vscode-stdout.txt");
+          await fs.promises.writeFile(outPath, stdoutLines.join("\n"), "utf8");
+          testInfo.attachments.push({
+            name: "vscode-stdout",
+            path: outPath,
+            contentType: "text/plain",
+          });
+        } catch (e) {
+          testInfo.attachments.push({
+            name: "vscode-stdout-write-error",
+            body: Buffer.from(String(e)),
+            contentType: "text/plain",
+          });
+        }
+      }
+      if (stderrLines.length) {
+        try {
+          const errPath = testInfo.outputPath("vscode-stderr.txt");
+          await fs.promises.writeFile(errPath, stderrLines.join("\n"), "utf8");
+          testInfo.attachments.push({
+            name: "vscode-stderr",
+            path: errPath,
+            contentType: "text/plain",
+          });
+        } catch (e) {
+          testInfo.attachments.push({
+            name: "vscode-stderr-write-error",
+            body: Buffer.from(String(e)),
+            contentType: "text/plain",
+          });
+        }
+      }
 
       const logPath = path.join(cachePath, "user-data", "logs");
-      if (fs.existsSync(logPath)) {
-        const logOutputPath = test.info().outputPath("vscode-logs");
-        await fs.promises.cp(logPath, logOutputPath, { recursive: true });
+      try {
+        if (fs.existsSync(logPath)) {
+          const logOutputPath = test.info().outputPath("vscode-logs");
+          await fs.promises.cp(logPath, logOutputPath, { recursive: true });
+        }
+      } catch (e) {
+        // Surface log copy failures without hiding the original test failure.
+        testInfo.attachments.push({
+          name: "vscode-logs-copy-error",
+          body: Buffer.from(String(e)),
+          contentType: "text/plain",
+        });
+      }
+
+      if (closeError) {
+        testInfo.attachments.push({
+          name: "electron-app-close-error",
+          body: Buffer.from(String(closeError)),
+          contentType: "text/plain",
+        });
       }
     },
     { timeout: 0 },
@@ -663,21 +1150,7 @@ export const test = base.extend<
         return tempDir;
       });
       for (const tempDir of tempDirs)
-        try {
-          await fs.promises.rm(tempDir, {
-            recursive: true,
-            force: true,
-            // VS Code can keep background file handles briefly after close.
-            // Retrying avoids flaky ENOTEMPTY/EBUSY during cleanup.
-            maxRetries: 10,
-            retryDelay: 100,
-          } as any);
-        }
-        catch (e) {
-          // Cleanup failures should not fail the test run.
-          // Emit a warning for diagnostics and continue.
-          console.warn(`Failed to cleanup temp dir '${tempDir}':`, e);
-        }
+        await fs.promises.rm(tempDir, { recursive: true });
     },
     { scope: "worker" },
   ],
