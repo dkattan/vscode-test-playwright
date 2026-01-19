@@ -33,6 +33,8 @@ export class VSCodeEvaluator {
 
     if (op === 'dispatchEvent') {
       const { objectId, event } = data as MessageResponseDataMap['dispatchEvent'];
+      if (objectId === undefined)
+        throw new Error(`Missing objectId for response op 'dispatchEvent'`);
       const listeners = this._listeners.get(objectId);
       if (listeners) {
         for (const listener of listeners)
@@ -41,9 +43,17 @@ export class VSCodeEvaluator {
       return;
     }
 
-    if (id && !this._pending.has(id))
+    if (id === undefined)
+      throw new Error(`Missing request id for response op '${op}'`);
+
+    if (!this._pending.has(id))
       throw new Error(`Could not find promise for request with ID ${id}`);
-    const { resolve, reject } = this._pending.get(id);
+
+    const pending = this._pending.get(id);
+    if (!pending)
+      throw new Error(`Could not find promise for request with ID ${id}`);
+
+    const { resolve, reject } = pending;
     this._pending.delete(id);
 
     switch (op) {
@@ -178,8 +188,15 @@ export class VSCodeEvaluator {
       result = await this._sendAndWait(op, data);
       return result;
     } catch (e) {
-      error = { error: { message: e.message, stack: e.stack, name: e.name } };
-      throw e;
+      const err = e as any;
+      error = {
+        error: {
+          message: err?.message ?? String(err),
+          stack: err?.stack,
+          name: err?.name,
+        },
+      };
+      throw err;
     } finally {
       await tracing.onAfterCall(frame, { ...metadata, endTime: monotonicTime(), error, result });
     }

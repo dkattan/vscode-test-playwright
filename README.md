@@ -17,7 +17,6 @@ Let's show some kitten love:
 
 See the example in [examples/custom-editor-sample/tests/draw.spec.ts](https://github.com/ruifigueira/vscode-test-playwright/blob/main/examples/custom-editor-sample/tests/draw.spec.ts).
 
-
 ## Core Features
 
 - Unified Test Runner:
@@ -92,6 +91,7 @@ test('should show a message', async ({ workbox, evaluateInVSCode }) => {
   await expect(toast.locator('.notification-list-item-message')).toContainText('Hello, World!');
 });
 ```
+
 - run it:
 
 ```bash
@@ -99,6 +99,52 @@ npx playwright test
 ```
 
 Generated report will include playwright traces from VS Code, which can be very helpful to identify issues of locators for UI elements.
+
+## Using an existing signed-in VS Code profile (Copilot/GitHub)
+
+When Playwright launches VS Code it typically uses an isolated `--user-data-dir`.
+That isolation is great for reproducibility, but it also means the spawned VS Code instance will not inherit your normal GitHub/Copilot sign-in state.
+
+This package supports cloning an existing VS Code user data directory into a per-run temporary directory, and then launching with `--user-data-dir` pointing at that clone.
+This avoids VS Code's single-instance handoff while preserving sign-in state.
+
+### Relevant environment variables
+
+- `PW_VSCODE_EXECUTABLE_PATH`
+  - If set, launches that VS Code installation instead of downloading via `@vscode/test-electron`.
+  - macOS examples: `/Applications/Visual Studio Code.app` or `/Applications/Visual Studio Code Insiders.app`.
+
+- `PW_VSCODE_PROFILE`
+  - Optional VS Code profile name to pass as `--profile <name>`.
+  - Use this when your auth lives in a non-default VS Code Profile.
+
+- `PW_VSCODE_CLONE_USER_DATA_FROM`
+  - Path to the source user data directory to clone from.
+  - Special value `default` resolves to the platform-default directory (e.g. `~/Library/Application Support/Code` on macOS stable).
+
+- `PW_VSCODE_CLONE_MODE`
+  - `full` (default): clone the full user data directory (still skips common cache directories).
+  - `minimal`: clone `User/` plus (optionally) a small allowlisted subset of `User/globalStorage`.
+
+- `PW_VSCODE_CLONE_INCLUDE_GLOBAL_STORAGE`
+  - In `minimal` mode, set to `0` to skip copying `User/globalStorage` entirely.
+  - Default is `1`.
+
+- `PW_VSCODE_CLONE_GLOBAL_STORAGE_ALLOWLIST`
+  - In `minimal` mode, a comma-separated list of extension ids whose `User/globalStorage/<extensionId>` directory should be copied.
+  - Example: `github.copilot,github.copilot-chat`.
+
+- `PW_VSCODE_CLONE_EXCLUDE_PATHS`
+  - Comma-separated list of *user-data-relative* paths to exclude from cloning.
+  - Matching is prefix-based: excluding `User/workspaceStorage` skips that directory and everything under it.
+  - Examples:
+    - `User/workspaceStorage`
+    - `User/globalStorage/github.copilot-chat`
+    - `User/storage.json`
+
+### Iteratively finding the minimal required copy set
+
+To determine which pieces of user-data are actually required for a signed-in Copilot run in your environment, run the same test repeatedly while excluding one path at a time via `PW_VSCODE_CLONE_EXCLUDE_PATHS` until the test fails (for example, you see a sign-in prompt).
 
 ## Recording a test
 
@@ -150,7 +196,7 @@ For instance, here's an example where we get as editor handle and then write tex
 ```ts
 test('write text into new document', async ({ evaluateHandleInVSCode, evaluateInVSCode }) => {
   const editorHandle = await evaluateHandleInVSCode(async (vscode, path) => {
-		return await vscode.window.showTextDocument(vscode.Uri.parse(path));
+  return await vscode.window.showTextDocument(vscode.Uri.parse(path));
   }, 'untitled:/hello.txt');
 
   await evaluateInVSCode(async (vscode, editor) => {
@@ -198,7 +244,7 @@ An example:
 ```ts
 test('listen to document changes', async ({ evaluateHandleInVSCode, evaluateInVSCode }) => {
   const editorHandle = await evaluateHandleInVSCode(async (vscode, path) => {
-		return await vscode.window.showTextDocument(vscode.Uri.parse(path));
+  return await vscode.window.showTextDocument(vscode.Uri.parse(path));
   }, 'untitled:/hello.txt');
 
   const documentChangedHandle = await evaluateHandleInVSCode(async vscode => {
