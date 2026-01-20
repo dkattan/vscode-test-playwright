@@ -506,33 +506,75 @@ export const test = base.extend<
       // Playwright's Electron launcher needs the actual executable.
       // On macOS, @vscode/test-electron provides an install directory containing
       // `Visual Studio Code.app`, so we must point at `.../Contents/MacOS/Electron`.
-      let electronExecutablePath = installPath;
-      if (os.platform() === "darwin") {
-        // Some versions return the Electron binary directly.
-        if (fs.existsSync(installPath)) {
-          const stat = fs.statSync(installPath);
-          if (stat.isFile() && path.basename(installPath) === "Electron") {
-            electronExecutablePath = installPath;
-          } else {
-            const appBundlePath = installPath.endsWith(".app")
-              ? installPath
-              : path.join(installPath, "Visual Studio Code.app");
-            const candidate = path.join(
-              appBundlePath,
-              "Contents",
-              "MacOS",
-              "Electron"
-            );
-            if (!fs.existsSync(candidate)) {
-              throw new Error(
-                `VS Code Electron executable not found at expected path: ${candidate}. ` +
-                  `Resolved installPath: ${installPath}`
-              );
-            }
-            electronExecutablePath = candidate;
-          }
+      const electronExecutablePath = (() => {
+        const platform = os.platform();
+
+        if (!fs.existsSync(installPath)) {
+          throw new Error(
+            `VS Code installPath does not exist: ${installPath}. ` +
+              `This path was produced by downloadAndUnzipVSCode or provided explicitly.`
+          );
         }
-      }
+
+        const stat = fs.statSync(installPath);
+
+        // If the path is already a file (executable), use it directly.
+        if (stat.isFile()) {
+          return installPath;
+        }
+
+        // macOS: @vscode/test-electron often returns an install directory
+        // containing the .app bundle; Playwright needs the Electron binary.
+        if (platform === "darwin") {
+          const appBundlePath = installPath.endsWith(".app")
+            ? installPath
+            : path.join(installPath, "Visual Studio Code.app");
+          const candidate = path.join(
+            appBundlePath,
+            "Contents",
+            "MacOS",
+            "Electron"
+          );
+          if (!fs.existsSync(candidate)) {
+            throw new Error(
+              `VS Code Electron executable not found at expected path: ${candidate}. ` +
+                `Resolved installPath: ${installPath}`
+            );
+          }
+          return candidate;
+        }
+
+        // Windows/Linux: downloadAndUnzipVSCode typically returns an install directory.
+        // Playwright's Electron launcher requires the actual executable.
+        if (stat.isDirectory()) {
+          const candidates =
+            platform === "win32"
+              ? [
+                  "Code.exe",
+                  "Code - Insiders.exe",
+                  "code.exe",
+                  path.join("bin", "code.cmd"),
+                ]
+              : ["code", "code-insiders"];
+
+          for (const rel of candidates) {
+            const abs = path.join(installPath, rel);
+            if (fs.existsSync(abs)) {
+              return abs;
+            }
+          }
+
+          throw new Error(
+            `VS Code executable not found under installPath directory: ${installPath}. ` +
+              `Tried: ${candidates.join(", ")}`
+          );
+        }
+
+        throw new Error(
+          `Unsupported VS Code installPath type for: ${installPath}. ` +
+            `Expected a file or directory.`
+        );
+      })();
 
       // remove all VSCODE_* environment variables, otherwise it fails to load custom webviews with the following error:
       // InvalidStateError: Failed to register a ServiceWorker: The document is in an invalid state
