@@ -81,6 +81,30 @@ export class VSCodeEvaluator {
     this._ws = ws;
     this._page = pageImpl;
     this._ws.on('message', data => this._responseHandler(data.toString()));
+
+    const rejectAllPending = (reason: unknown) => {
+      for (const [id, { reject }] of this._pending.entries()) {
+        try {
+          reject(reason instanceof Error ? reason : new Error(String(reason)));
+        } catch {
+          // ignore
+        }
+      }
+      this._pending.clear();
+    };
+
+    this._ws.on('close', (code, reason) => {
+      rejectAllPending(
+        new Error(
+          `VSCode test server websocket closed (code=${code}, reason=${reason.toString()})`
+        )
+      );
+    });
+
+    this._ws.on('error', (err) => {
+      rejectAllPending(err);
+    });
+
     this._cache.set(0, new ObjectHandle(0, this));
   }
 
@@ -156,6 +180,12 @@ export class VSCodeEvaluator {
   }
 
   private async _sendAndWait<K extends keyof MessageRequestDataMap>(op: K, data: MessageRequestDataMap[K]): Promise<MessageResponseDataMap[K]> {
+    // Avoid hanging forever: if the socket is not open, fail immediately.
+    if (this._ws.readyState !== this._ws.OPEN) {
+      throw new Error(
+        `Cannot send '${String(op)}' to VS Code test server: websocket not open (readyState=${this._ws.readyState})`
+      );
+    }
     const id = ++this._lastId;
     this._ws.send(JSON.stringify({ op, id, data }));
     return await new Promise((resolve, reject) => this._pending.set(id, { resolve, reject }));

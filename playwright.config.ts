@@ -4,6 +4,7 @@ import type { VSCodeTestOptions, VSCodeWorkerOptions } from 'vscode-test-playwri
 
 export default defineConfig<VSCodeTestOptions, VSCodeWorkerOptions>({
   testDir: './tests',
+  maxFailures: 1,
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,

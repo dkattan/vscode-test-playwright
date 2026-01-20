@@ -8,6 +8,9 @@ import {
 } from "@playwright/test";
 import {
   downloadAndUnzipVSCode,
+  makeConsoleReporter,
+  ProgressReportStage,
+  type ProgressReporter,
   resolveCliArgsFromVSCodeExecutablePath,
 } from "@vscode/test-electron";
 import * as cp from "child_process";
@@ -25,6 +28,16 @@ import {
   VSCodeHandle,
 } from "./vscodeHandle";
 export { expect } from "@playwright/test";
+
+function debugEnabled(): boolean {
+  return process.env.PW_VSCODE_DEBUG === "1";
+}
+
+function debugLog(message: string) {
+  if (!debugEnabled()) return;
+  // Keep it grep-friendly in CI logs.
+  console.log(`[vscode-test-playwright][debug] ${message}`);
+}
 
 export type VSCodeWorkerOptions = {
   vscodeVersion: string;
@@ -90,7 +103,7 @@ type ExperimentalVSCodeTestFixtures = {
 
 type InternalWorkerFixtures = {
   _createTempDir: () => Promise<string>;
-  _vscodeInstall: { installPath: string; cachePath: string };
+  _vscodeInstall: { installPath: string; cachePath: string; downloadedPath?: string };
 };
 
 type InternalTestFixtures = {
@@ -205,7 +218,7 @@ function discoverVSCodeExecutablePath(): string | undefined {
 
 // adapted from https://github.com/microsoft/playwright/blob/a6b320e36224f70ad04fd520503c230d5956ba66/packages/playwright-core/src/server/electron/electron.ts#L294-L320
 function waitForLine(
-  process: cp.ChildProcess,
+  childProcess: cp.ChildProcess,
   regex: RegExp
 ): Promise<RegExpMatchArray> {
   function addEventListener(
@@ -232,7 +245,25 @@ function waitForLine(
   return new Promise((resolve, reject) => {
     const failError = new Error("Process failed to launch!");
 
-    const rls = [process.stdout, process.stderr]
+    const timeoutMs = (() => {
+      const raw = process.env.PW_VSCODE_WAIT_FOR_LINE_TIMEOUT_MS;
+      if (!raw) return undefined;
+      const n = Number(raw);
+      return Number.isFinite(n) && n > 0 ? n : undefined;
+    })();
+
+    const timer = timeoutMs
+      ? setTimeout(() => {
+          cleanup();
+          reject(
+            new Error(
+              `Timed out after ${timeoutMs}ms waiting for process output matching ${regex}`
+            )
+          );
+        }, timeoutMs)
+      : undefined;
+
+    const rls = [childProcess.stdout, childProcess.stderr]
       .filter(Boolean)
       .map((stream) => readline.createInterface({ input: stream! }));
 
@@ -243,12 +274,13 @@ function waitForLine(
 
     const listeners = [
       ...rls.map((rl) => addEventListener(rl, "line", onLine)),
-      addEventListener(process, "exit", reject.bind(null, failError)),
+      addEventListener(childProcess, "exit", reject.bind(null, failError)),
       // It is Ok to remove error handler because we did not create process and there is another listener.
-      addEventListener(process, "error", reject.bind(null, failError)),
+      addEventListener(childProcess, "error", reject.bind(null, failError)),
     ];
 
     function onLine(line: string) {
+      debugLog(`process output: ${line}`);
       const match = line.match(regex);
       if (!match) return;
       cleanup();
@@ -256,6 +288,7 @@ function waitForLine(
     }
 
     function cleanup() {
+      if (timer) clearTimeout(timer);
       removeEventListeners(listeners);
       for (const rl of rls) {
         try {
@@ -391,10 +424,35 @@ export const test = base.extend<
         `worker-${workerInfo.parallelIndex}`
       );
       await fs.promises.mkdir(installBasePath, { recursive: true });
+      let downloadedPath: string | undefined;
+      const consoleReporter = await makeConsoleReporter();
+      const reporter: ProgressReporter = {
+        report: (report) => {
+          if (
+            report.stage === ProgressReportStage.FoundMatchingInstall ||
+            report.stage === ProgressReportStage.NewInstallComplete ||
+            report.stage === ProgressReportStage.ReplacingOldInsiders
+          ) {
+            downloadedPath = report.downloadedPath;
+          }
+          consoleReporter.report(report);
+        },
+        error: (err) => consoleReporter.error(err),
+      };
+
       const installPath = await downloadAndUnzipVSCode({
         cachePath: installBasePath,
         version: vscodeVersion,
+        reporter,
       });
+
+      // Helpful for CI diagnostics: this prints once per worker.
+      console.log(
+        `[vscode-test-playwright] downloadAndUnzipVSCode returned: ${installPath}` +
+          (downloadedPath
+            ? ` (downloadedPath: ${downloadedPath})`
+            : " (downloadedPath unavailable)")
+      );
       const [cliPath] = resolveCliArgsFromVSCodeExecutablePath(installPath);
 
       if (!fs.existsSync(cliPath)) {
@@ -440,7 +498,7 @@ export const test = base.extend<
         });
       }
 
-      await use({ installPath, cachePath });
+      await use({ installPath, cachePath, downloadedPath });
     },
     { timeout: 0, scope: "worker" },
   ],
@@ -461,7 +519,7 @@ export const test = base.extend<
       use,
       testInfo
     ) => {
-      const { installPath, cachePath } = _vscodeInstall;
+      const { installPath, cachePath, downloadedPath } = _vscodeInstall;
 
       const videoOption = (testInfo.project.use as any)?.video;
       const videoMode = getVideoMode(videoOption);
@@ -476,8 +534,9 @@ export const test = base.extend<
       }
 
 
+      // Default to isolation for deterministic runs (opt out with =0).
       const isolateExtensionsDir =
-        process.env.PW_VSCODE_ISOLATE_EXTENSIONS_DIR === "1";
+        process.env.PW_VSCODE_ISOLATE_EXTENSIONS_DIR !== "0";
 
       // Always launch with an explicit user-data-dir to avoid macOS single-instance
       // handoff behavior (which can cause the Electron app to exit immediately and
@@ -509,26 +568,46 @@ export const test = base.extend<
       const electronExecutablePath = (() => {
         const platform = os.platform();
 
-        if (!fs.existsSync(installPath)) {
+        // Prefer the install directory (downloadedPath) when available, because
+        // @vscode/test-electron may return a platform-specific launcher path.
+        // However, when @vscode/test-electron returns a direct Electron binary
+        // path (common on macOS), we must not discard it.
+        if (downloadedPath && fs.existsSync(installPath)) {
+          try {
+            const installStat = fs.statSync(installPath);
+            if (installStat.isFile()) {
+              return installPath;
+            }
+          } catch {
+            // Ignore and fall back to directory resolution below.
+          }
+        }
+
+        const pathForResolution = downloadedPath ?? installPath;
+
+        if (!fs.existsSync(pathForResolution)) {
           throw new Error(
-            `VS Code installPath does not exist: ${installPath}. ` +
-              `This path was produced by downloadAndUnzipVSCode or provided explicitly.`
+            `VS Code installPath does not exist: ${pathForResolution}. ` +
+              `downloadAndUnzipVSCode returned: ${installPath}. ` +
+              (downloadedPath
+                ? `Progress reporter downloadedPath: ${downloadedPath}. `
+                : "Progress reporter downloadedPath not available. ")
           );
         }
 
-        const stat = fs.statSync(installPath);
+        const stat = fs.statSync(pathForResolution);
 
         // If the path is already a file (executable), use it directly.
         if (stat.isFile()) {
-          return installPath;
+          return pathForResolution;
         }
 
         // macOS: @vscode/test-electron often returns an install directory
         // containing the .app bundle; Playwright needs the Electron binary.
         if (platform === "darwin") {
-          const appBundlePath = installPath.endsWith(".app")
-            ? installPath
-            : path.join(installPath, "Visual Studio Code.app");
+          const appBundlePath = pathForResolution.endsWith(".app")
+            ? pathForResolution
+            : path.join(pathForResolution, "Visual Studio Code.app");
           const candidate = path.join(
             appBundlePath,
             "Contents",
@@ -538,7 +617,7 @@ export const test = base.extend<
           if (!fs.existsSync(candidate)) {
             throw new Error(
               `VS Code Electron executable not found at expected path: ${candidate}. ` +
-                `Resolved installPath: ${installPath}`
+                `Resolved installPath: ${pathForResolution}`
             );
           }
           return candidate;
@@ -558,30 +637,43 @@ export const test = base.extend<
               : ["code", "code-insiders"];
 
           for (const rel of candidates) {
-            const abs = path.join(installPath, rel);
+            const abs = path.join(pathForResolution, rel);
             if (fs.existsSync(abs)) {
               return abs;
             }
           }
 
           throw new Error(
-            `VS Code executable not found under installPath directory: ${installPath}. ` +
+            `VS Code executable not found under installPath directory: ${pathForResolution}. ` +
               `Tried: ${candidates.join(", ")}`
           );
         }
 
         throw new Error(
-          `Unsupported VS Code installPath type for: ${installPath}. ` +
+          `Unsupported VS Code installPath type for: ${pathForResolution}. ` +
             `Expected a file or directory.`
         );
       })();
 
+      debugLog(`installPath=${installPath}`);
+      if (downloadedPath) debugLog(`downloadedPath=${downloadedPath}`);
+      debugLog(`electronExecutablePath=${electronExecutablePath}`);
+      debugLog(`effectiveUserDataDir=${effectiveUserDataDir}`);
+      debugLog(
+        `effectiveExtensionsDir=${effectiveExtensionsDir ?? "<default>"} (isolate=${isolateExtensionsDir})`
+      );
+
       // remove all VSCODE_* environment variables, otherwise it fails to load custom webviews with the following error:
       // InvalidStateError: Failed to register a ServiceWorker: The document is in an invalid state
       const env = { ...process.env } as Record<string, string>;
+      let removedEnvCount = 0;
       for (const prop in env) {
-        if (/^VSCODE_/i.test(prop)) delete env[prop];
+        if (/^VSCODE_/i.test(prop)) {
+          delete env[prop];
+          removedEnvCount++;
+        }
       }
+      debugLog(`removed ${removedEnvCount} VSCODE_* env vars`);
 
       const electronApp = await _electron.launch({
         executablePath: electronExecutablePath,
@@ -621,6 +713,8 @@ export const test = base.extend<
         ],
       });
 
+      debugLog(`_electron.launch() returned; waiting for firstWindow()`);
+
       // Capture early process output to aid debugging when VS Code exits before firstWindow() is ready.
       const outputLineLimit = 2000;
       const stdoutLines: string[] = [];
@@ -640,6 +734,26 @@ export const test = base.extend<
       const onStderr = (b: Buffer) => pushLines(stderrLines, b);
       childProcess?.stdout?.on("data", onStdout);
       childProcess?.stderr?.on("data", onStderr);
+
+      // Sanity-check logging: if PW_VSCODE_DEBUG=1, mirror output live to the
+      // test runner console so it's visible without opening attachments.
+      if (debugEnabled()) {
+        childProcess?.stdout?.on("data", (b) => {
+          for (const l of b.toString("utf8").split(/\r?\n/)) {
+            if (l) console.log(`[vscode-test-playwright][vscode stdout] ${l}`);
+          }
+        });
+        childProcess?.stderr?.on("data", (b) => {
+          for (const l of b.toString("utf8").split(/\r?\n/)) {
+            if (l) console.log(`[vscode-test-playwright][vscode stderr] ${l}`);
+          }
+        });
+        childProcess?.on("exit", (code, signal) => {
+          console.log(
+            `[vscode-test-playwright][debug] VS Code process exited: code=${code}, signal=${signal}`
+          );
+        });
+      }
 
       const traceMode = getTraceMode(vscodeTrace);
       const captureTrace = shouldCaptureTrace(traceMode, testInfo);
@@ -826,9 +940,18 @@ export const test = base.extend<
     // Wait for URL to access VSCode test server.
     const vscodeTestServerRegExp =
       /^VSCodeTestServer listening on (http:\/\/.*)$/;
+    debugLog(`waiting for test server line: ${vscodeTestServerRegExp}`);
     const match = await waitForLine(process, vscodeTestServerRegExp);
+    debugLog(`matched test server line; url=${match[1]}`);
     const ws = new WebSocket(match[1]);
+    ws.on("error", (e) => debugLog(`test server websocket error: ${String(e)}`));
+    ws.on("close", (code, reason) =>
+      debugLog(
+        `test server websocket closed: code=${code}, reason=${reason.toString()}`
+      )
+    );
     await new Promise((r) => ws.once("open", r));
+    debugLog(`test server websocket open`);
     // Without access to Playwright internal Page implementation, tracing
     // integration is disabled. Calls still work; they just won't be added to
     // the trace timeline.

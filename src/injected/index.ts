@@ -9,7 +9,7 @@ class VSCodeTestServer {
   private _lastObjectId = 0;
   private _objectsById = new Map<number, any>([[0, vscode]]);
   private _idByObjects = new Map<any, number>([[vscode, 0]]);
-  private _eventEmitters = new Map<number, vscode.Disposable & { listenerCount: number }>();
+  private _eventEmitters = new Map<number, { disposable: vscode.Disposable; listenerCount: number }>();
 
   constructor(ws: WebSocket) {
     this._ws = ws;
@@ -32,7 +32,7 @@ class VSCodeTestServer {
     const emitters = this._eventEmitters.values();
     this._eventEmitters.clear();
     for (const emitter of emitters)
-      emitter.dispose();
+      emitter.disposable.dispose();
   }
 
   private _handleMessage({ op, id, data }: RequestMessage) {
@@ -69,8 +69,8 @@ class VSCodeTestServer {
           this._objectsById.set(objectId, result);
           this._idByObjects.set(result, objectId);
           if (result instanceof vscode.EventEmitter) {
-            const { dispose } = result.event(e => this._emit(objectId, e));
-            this._eventEmitters.set(objectId, { dispose, listenerCount: 0 });
+            const disposable = result.event(e => this._emit(objectId, e));
+            this._eventEmitters.set(objectId, { disposable, listenerCount: 0 });
             result = { __vscodeHandle: 'eventEmitter', objectId } satisfies VSCodeHandleObject;
           } else {
             result = { __vscodeHandle: true, objectId } satisfies VSCodeHandleObject;
@@ -105,7 +105,7 @@ class VSCodeTestServer {
     if (obj !== undefined) {
       this._objectsById.delete(objectId);
       this._idByObjects.delete(obj);
-      this._eventEmitters.get(objectId)?.dispose();
+      this._eventEmitters.get(objectId)?.disposable.dispose();
       this._eventEmitters.delete(objectId);
       if (dispose)
         obj.dispose?.();
