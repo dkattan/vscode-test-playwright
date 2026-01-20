@@ -741,6 +741,19 @@ export const test = base.extend<
       }
       debugLog(`removed ${removedEnvCount} VSCODE_* env vars`);
 
+      const platformArgs: string[] = [];
+      if (os.platform() === "linux") {
+        // Harden CI stability on Linux runners.
+        // These are safe in headless/Xvfb environments and help avoid early
+        // exits related to GPU/DBus/dev-shm constraints.
+        platformArgs.push(
+          "--disable-gpu",
+          "--disable-dev-shm-usage",
+          "--disable-setuid-sandbox",
+          "--disable-software-rasterizer"
+        );
+      }
+
       const electronApp = await _electron.launch({
         executablePath: electronExecutablePath,
         env,
@@ -753,6 +766,7 @@ export const test = base.extend<
             }
           : {}),
         args: [
+          ...platformArgs,
           // Stolen from https://github.com/microsoft/vscode-test/blob/0ec222ef170e102244569064a12898fb203e5bb7/lib/runTest.ts#L126-L160
           // https://github.com/microsoft/vscode/issues/84238
           "--no-sandbox",
