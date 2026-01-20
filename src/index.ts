@@ -243,7 +243,28 @@ function waitForLine(
   }
 
   return new Promise((resolve, reject) => {
-    const failError = new Error("Process failed to launch!");
+    const maxRecentLines = 200;
+    const recentLines: string[] = [];
+
+    const pushRecent = (source: string, line: string) => {
+      const prefixed = `[${source}] ${line}`;
+      recentLines.push(prefixed);
+      if (recentLines.length > maxRecentLines) {
+        recentLines.splice(0, recentLines.length - maxRecentLines);
+      }
+    };
+
+    const formatRecent = () => {
+      if (!recentLines.length) return "<no process output captured>";
+      return recentLines.join("\n");
+    };
+
+    const failError = new Error(
+      `Process failed to launch while waiting for output matching ${regex}.\n` +
+        `Recent output (last ${maxRecentLines} lines max):\n${formatRecent()}`
+    );
+
+    let finished = false;
 
     const timeoutMs = (() => {
       const raw = process.env.PW_VSCODE_WAIT_FOR_LINE_TIMEOUT_MS;
@@ -254,43 +275,88 @@ function waitForLine(
 
     const timer = timeoutMs
       ? setTimeout(() => {
-          cleanup();
-          reject(
+          finishReject(
             new Error(
-              `Timed out after ${timeoutMs}ms waiting for process output matching ${regex}`
+              `Timed out after ${timeoutMs}ms waiting for process output matching ${regex}.\n` +
+                `Recent output (last ${maxRecentLines} lines max):\n${formatRecent()}`
             )
           );
         }, timeoutMs)
       : undefined;
 
-    const rls = [childProcess.stdout, childProcess.stderr]
-      .filter(Boolean)
-      .map((stream) => readline.createInterface({ input: stream! }));
+    const rls = [
+      childProcess.stdout
+        ? {
+            source: "stdout",
+            rl: readline.createInterface({ input: childProcess.stdout }),
+          }
+        : undefined,
+      childProcess.stderr
+        ? {
+            source: "stderr",
+            rl: readline.createInterface({ input: childProcess.stderr }),
+          }
+        : undefined,
+    ].filter(Boolean) as Array<{ source: string; rl: readline.Interface }>;
 
     if (!rls.length) {
-      reject(failError);
+      finishReject(
+        new Error(
+          `Process has no stdout/stderr streams; cannot wait for output matching ${regex}.`
+        )
+      );
       return;
     }
 
     const listeners = [
-      ...rls.map((rl) => addEventListener(rl, "line", onLine)),
-      addEventListener(childProcess, "exit", reject.bind(null, failError)),
+      ...rls.map(({ rl, source }) =>
+        addEventListener(rl, "line", (line: string) => onLine(source, line))
+      ),
+      addEventListener(childProcess, "exit", (code: number | null, signal) => {
+        finishReject(
+          new Error(
+            `Process exited before emitting output matching ${regex} (code=${code}, signal=${signal}).\n` +
+              `Recent output (last ${maxRecentLines} lines max):\n${formatRecent()}`
+          )
+        );
+      }),
       // It is Ok to remove error handler because we did not create process and there is another listener.
-      addEventListener(childProcess, "error", reject.bind(null, failError)),
+      addEventListener(childProcess, "error", (err: unknown) => {
+        finishReject(
+          new Error(
+            `Process emitted error before emitting output matching ${regex}: ${String(err)}\n` +
+              `Recent output (last ${maxRecentLines} lines max):\n${formatRecent()}`
+          )
+        );
+      }),
     ];
 
-    function onLine(line: string) {
+    function onLine(source: string, line: string) {
       debugLog(`process output: ${line}`);
+      pushRecent(source, line);
       const match = line.match(regex);
       if (!match) return;
+      finishResolve(match);
+    }
+
+    function finishResolve(match: RegExpMatchArray) {
+      if (finished) return;
+      finished = true;
       cleanup();
       resolve(match);
+    }
+
+    function finishReject(err: Error) {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      reject(err);
     }
 
     function cleanup() {
       if (timer) clearTimeout(timer);
       removeEventListeners(listeners);
-      for (const rl of rls) {
+      for (const { rl } of rls) {
         try {
           rl.close();
         } catch {
