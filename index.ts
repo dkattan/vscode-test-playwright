@@ -6,7 +6,6 @@
  * - Add Electron recordVideo wiring so we can produce real videos for VS Code runs.
  */
 
-import type { BrowserWindow } from "electron";
 import type {
   ObjectHandle,
   ObjectHandle as ObjectHandleImpl,
@@ -17,10 +16,8 @@ import type {
 } from "./vscodeHandle";
 import * as cp from "node:child_process";
 import * as fs from "node:fs";
-import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import process from "node:process";
 import {
   _electron,
   test as base,
@@ -36,7 +33,8 @@ import {
 import { WebSocket } from "ws";
 import { VSCodeEvaluator as VSCodeEvaluatorImpl } from "./vscodeHandle";
 
-export { expect } from "@playwright/test";
+// NOTE: Export `expect` from this module for convenience. We bind it to the
+// current test instance (test.expect) later.
 
 export type VSCodeVideoMode = "off" | "on" | "retain-on-failure";
 
@@ -71,9 +69,15 @@ export interface VSCodeTestOptions {
   baseDir: string;
 }
 
+type VSCodeCommandsLike = {
+  executeCommand: (command: string, ...args: unknown[]) => Promise<unknown>;
+};
+
 interface VSCodeTestFixtures {
   electronApp: ElectronApplication;
   workbox: Page;
+  /** Convenience wrapper for calling VS Code commands (executeCommand) from Node. */
+  vscode: { commands: VSCodeCommandsLike };
   evaluateInVSCode: (<R>(
     vscodeFunction: VSCodeFunctionOn<VSCode, void, R>
   ) => Promise<R>) &
@@ -169,20 +173,90 @@ function toEven(n: number) {
 }
 
 async function allocateLocalPort(): Promise<number> {
-  const server = net.createServer();
-  try {
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => resolve());
-    });
-    const address = server.address();
-    if (!address || typeof address === "string") {
-      throw new TypeError("Expected net.Server to have an AddressInfo");
+  throw new Error(
+    "allocateLocalPort is no longer used. The injected VSCodeTestServer binds to an ephemeral port and reports it via process output."
+  );
+}
+
+async function waitForLine(
+  childProcess: cp.ChildProcess,
+  regex: RegExp
+): Promise<RegExpMatchArray> {
+  return await new Promise((resolve, reject) => {
+    const rls = [
+      childProcess.stdout
+        ? {
+            source: "stdout",
+            rl: require("node:readline").createInterface({
+              input: childProcess.stdout,
+            }),
+          }
+        : undefined,
+      childProcess.stderr
+        ? {
+            source: "stderr",
+            rl: require("node:readline").createInterface({
+              input: childProcess.stderr,
+            }),
+          }
+        : undefined,
+    ].filter(Boolean) as Array<{
+      source: string;
+      rl: import("node:readline").Interface;
+    }>;
+
+    if (!rls.length) {
+      reject(
+        new Error(
+          `Process has no stdout/stderr streams; cannot wait for output matching ${regex}.`
+        )
+      );
+      return;
     }
-    return address.port;
-  } finally {
-    server.close();
-  }
+
+    const cleanup = () => {
+      for (const { rl } of rls) {
+        try {
+          rl.close();
+        } catch {
+          // ignore
+        }
+      }
+      childProcess.off("exit", onExit);
+      childProcess.off("error", onError);
+    };
+
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      reject(
+        new Error(
+          `Process exited before emitting output matching ${regex} (code=${code}, signal=${signal}).`
+        )
+      );
+    };
+    const onError = (err: unknown) => {
+      cleanup();
+      reject(
+        new Error(
+          `Process emitted error before emitting output matching ${regex}: ${String(err)}`
+        )
+      );
+    };
+
+    childProcess.on("exit", onExit);
+    childProcess.on("error", onError);
+
+    for (const { rl } of rls) {
+      rl.on("line", (line: string) => {
+        const match = line.match(regex);
+        if (!match) {
+          return;
+        }
+        cleanup();
+        resolve(match);
+      });
+    }
+  });
 }
 
 export const test = base.extend<
@@ -293,18 +367,8 @@ export const test = base.extend<
       }
 
       // NOTE: VS Code's --extensionTestsPath must point at a JS file. We rely on `npm run compile-tests`
-      // to produce `out/` before running Playwright.
-      const injectedEntryPath = path.join(
-        process.cwd(),
-        "out",
-        "vscode-test-playwright",
-        "injected",
-        "index.js"
-      );
-
-      const wsPort = await allocateLocalPort();
-      env.PW_VSCODE_TEST_WS_PORT = String(wsPort);
-      process.env.PW_VSCODE_TEST_WS_PORT = String(wsPort);
+      // to produce `dist/` before running Playwright.
+      const injectedEntryPath = path.join(__dirname, "injected", "index.js");
 
       const videoOptions = normalizeVideoOptions(vscodeVideo);
       const shouldRecordVideo = videoOptions.mode !== "off";
@@ -388,8 +452,8 @@ export const test = base.extend<
           const deadline = Date.now() + 5_000;
 
           function tryGetFirstWindow() {
-            const all = BrowserWindow.getAllWindows() as BrowserWindow[];
-            return all[0] ?? null;
+            const all = (BrowserWindow.getAllWindows?.() ?? []) as unknown[];
+            return (all[0] as any) ?? null;
           }
 
           // Wait for the first VS Code window to actually exist.
@@ -485,98 +549,28 @@ export const test = base.extend<
     use,
     testInfo
   ) => {
-    interface ElectronAppImplLike {
-      _process: cp.ChildProcess;
-      _nodeConnection: {
-        _browserLogsCollector: {
-          recentLogs: () => string[];
-        };
-      };
-    }
-
-    // Playwright no longer exposes `playwright._toImpl` in newer versions.
-    // Use the ChannelOwner connection helper instead.
     void playwright;
-    const connection = (electronApp as unknown as { _connection?: unknown })
-      ._connection;
-    if (!connection || typeof connection !== "object") {
-      throw new TypeError(
-        "Expected electronApp._connection to be an object (Playwright internal API changed)."
-      );
-    }
-    const toImplUnknown = (connection as { toImpl?: unknown }).toImpl;
-    if (typeof toImplUnknown !== "function") {
-      throw new TypeError(
-        "Expected electronApp._connection.toImpl to be a function (Playwright internal API changed)."
-      );
-    }
-    const toImpl = toImplUnknown as <T>(obj: T) => unknown;
+    void vscodeTrace;
+    void testInfo;
 
-    const electronAppImpl =
-      (await Promise.resolve(toImpl(electronApp))) as ElectronAppImplLike;
-    const wsPortRaw = process.env.PW_VSCODE_TEST_WS_PORT;
-    if (!wsPortRaw) {
-      throw new Error("Missing required env var: PW_VSCODE_TEST_WS_PORT");
+    // The injected server prints:
+    //   VSCodeTestServer listening on http://localhost:<port>
+    // We wait for that line on the VS Code process streams and connect.
+    const vscodeTestServerRegExp =
+      /^VSCodeTestServer listening on (http:\/\/.*)$/;
+    const proc = electronApp.process();
+    if (!proc) {
+      throw new Error("Expected ElectronApplication.process() to return a ChildProcess");
     }
-    const wsPort = Number.parseInt(wsPortRaw, 10);
-    if (!Number.isFinite(wsPort) || wsPort <= 0) {
-      throw new TypeError(`Invalid PW_VSCODE_TEST_WS_PORT: ${wsPortRaw}`);
-    }
-
-    const readyNeedle = `VSCodeTestServer listening on http://localhost:${wsPort}`;
-    const logDeadline = Date.now() + 5_000;
-    let sawReadyLog = false;
-    while (!sawReadyLog && Date.now() < logDeadline) {
-      const recentLogs = electronAppImpl._nodeConnection._browserLogsCollector
-        .recentLogs();
-      sawReadyLog = recentLogs.some((s) => s.includes(readyNeedle));
-      if (!sawReadyLog) {
-        await new Promise((r) => setTimeout(r, 50));
-      }
-    }
-    if (!sawReadyLog) {
-      const recentLogs = electronAppImpl._nodeConnection._browserLogsCollector
-        .recentLogs();
-      throw new Error(
-        `VSCodeTestServer never reported readiness for port ${wsPort}. Recent logs:\n${recentLogs.slice(-80).join("\n")}`
-      );
-    }
-
-    const wsUrl = `ws://127.0.0.1:${wsPort}`;
-    const ws = await (async () => {
-      const deadline = Date.now() + 5_000;
-      let lastError: unknown;
-      while (Date.now() < deadline) {
-        const attempt = new WebSocket(wsUrl);
-        try {
-          await new Promise<void>((resolve, reject) => {
-            const timeout = setTimeout(() => {
-              reject(new Error(`Timed out waiting for WebSocket open: ${wsUrl}`));
-            }, 500);
-
-            attempt.once("open", () => {
-              clearTimeout(timeout);
-              resolve();
-            });
-            attempt.once("error", (err) => {
-              clearTimeout(timeout);
-              reject(err);
-            });
-          });
-          return attempt;
-        } catch (err: unknown) {
-          lastError = err;
-          attempt.close();
-          await new Promise((r) => setTimeout(r, 100));
-        }
-      }
-      throw lastError ?? new Error(`Failed to connect WebSocket: ${wsUrl}`);
-    })();
+    const match = await waitForLine(proc, vscodeTestServerRegExp);
+    const ws = new WebSocket(match[1]);
+    await new Promise<void>((r, reject) => {
+      ws.once("open", () => r());
+      ws.once("error", reject);
+    });
     // Our current Playwright build no longer exposes the private tracing hooks
     // expected by the vendored evaluator (Tracing.onBeforeCall/onAfterCall).
     // Disable this integration; VS Code traces are still collected separately.
-    void vscodeTrace;
-    void testInfo;
     const pageImpl = undefined;
     const evaluator = new VSCodeEvaluatorImpl(ws, pageImpl);
     await use(evaluator);
@@ -585,6 +579,22 @@ export const test = base.extend<
 
   _vscodeHandle: async ({ _evaluator }, use) => {
     await use(_evaluator.rootHandle() as ObjectHandleImpl<VSCode>);
+  },
+
+  vscode: async ({ _vscodeHandle }, use) => {
+    const vscode: { commands: VSCodeCommandsLike } = {
+      commands: {
+        executeCommand: async (command: string, ...args: unknown[]) => {
+          return await _vscodeHandle.evaluate(
+            (vscode, payload) =>
+              vscode.commands.executeCommand(payload.command, ...payload.args),
+            { command, args }
+          );
+        },
+      },
+    };
+
+    await use(vscode);
   },
 
   evaluateInVSCode: async ({ _vscodeHandle }, use) => {
@@ -691,3 +701,5 @@ export const test = base.extend<
     { timeout: 0 },
   ],
 });
+
+export const expect = test.expect;

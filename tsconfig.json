@@ -14,6 +14,20 @@
     "forceConsistentCasingInFileNames": true
   },
   "include": [
-    "src/**/*"
+    "index.ts",
+    "vscodeHandle.ts",
+    "jsonRpcWsTransport.ts",
+    "rpcTypes.ts",
+    "injected/**/*"
+  ],
+  "exclude": [
+    "src/**",
+    "node_modules/**",
+    "dist/**",
+    "tests/**",
+    "examples/**",
+    "docs/**",
+    "playwright-report/**",
+    "test-results/**"
   ]
 }

@@ -2,7 +2,6 @@
 import type { AddressInfo } from "node:net";
 import type { RawData, WebSocket } from "ws";
 import { createServer } from "node:http";
-import process from "node:process";
 import * as vscode from "vscode";
 import {
   createMessageConnection,
