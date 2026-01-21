@@ -18,7 +18,7 @@
     "vscodeHandle.ts",
     "jsonRpcWsTransport.ts",
     "rpcTypes.ts",
-    "injected/**/*"
+    "vscodeTestServer/**/*"
   ],
   "exclude": [
     "src/**",

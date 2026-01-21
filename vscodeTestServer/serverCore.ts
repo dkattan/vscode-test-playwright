@@ -1,5 +1,4 @@
-import type { RawData } from "ws";
-import { WebSocket } from "ws";
+import type { RawData, WebSocket } from "ws";
 import * as vscode from "vscode";
 import {
   createMessageConnection,
@@ -19,7 +18,7 @@ import {
   RPC,
 } from "../rpcTypes";
 
-class VSCodeTestServer {
+export class VSCodeTestServer {
   private readonly ws: WebSocket;
   private readonly connection: MessageConnection;
   private _lastObjectId = 0;
@@ -58,6 +57,8 @@ class VSCodeTestServer {
   }
 
   async run() {
+    // Begin listening immediately. The Node harness may send requests as soon as
+    // the TCP handshake completes.
     this.connection.listen();
 
     await Promise.all([
@@ -110,22 +111,22 @@ class VSCodeTestServer {
           );
         }
 
-        let objectId = this._idByObjects.get(result);
-        if (objectId === undefined) {
-          objectId = ++this._lastObjectId;
-          this._objectsById.set(objectId, result);
-          this._idByObjects.set(result, objectId);
+        let id = this._idByObjects.get(result);
+        if (id === undefined) {
+          id = ++this._lastObjectId;
+          this._objectsById.set(id, result);
+          this._idByObjects.set(result, id);
           if (result instanceof vscode.EventEmitter) {
-            const { dispose } = result.event((e) => this._emit(objectId!, e));
-            this._eventEmitters.set(objectId, { dispose, listenerCount: 0 });
+            const { dispose } = result.event((e) => this._emit(id!, e));
+            this._eventEmitters.set(id, { dispose, listenerCount: 0 });
             result = {
               __vscodeHandle: "eventEmitter",
-              objectId,
+              objectId: id,
             };
           } else {
             result = {
               __vscodeHandle: true,
-              objectId,
+              objectId: id,
             };
           }
         }
@@ -214,39 +215,4 @@ class VSCodeTestServer {
       void this.connection.sendNotification(RPC.dispatchEvent, payload);
     }
   }
-}
-
-export async function run() {
-  const url = process.env.PW_VSCODE_TEST_WS_URL;
-  if (!url) {
-    throw new Error(
-      "PW_VSCODE_TEST_WS_URL was not set. The Playwright harness must provide the WebSocket server URL for the injected test server to connect to."
-    );
-  }
-
-  process.stderr.write(`VSCodeTestServer connecting to ${url}\n`);
-
-  const ws = new WebSocket(url);
-
-  // IMPORTANT: Start the JSON-RPC listener immediately. The harness may begin
-  // sending requests as soon as the connection is established.
-  const testServer = new VSCodeTestServer(ws);
-  const runPromise = testServer.run();
-
-  await new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(
-      () => reject(new Error(`Timed out connecting to ${url}`)),
-      30_000
-    );
-    ws.once("open", () => {
-      clearTimeout(timeout);
-      resolve();
-    });
-    ws.once("error", (err) => {
-      clearTimeout(timeout);
-      reject(err);
-    });
-  });
-
-  await runPromise;
 }

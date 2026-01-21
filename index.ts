@@ -245,7 +245,7 @@ export const test = base.extend<
             }
             reject(
               new Error(
-                "Timed out waiting for injected WebSocket connection (PW_VSCODE_TEST_WS_URL)."
+                  "Timed out waiting for extension host WebSocket connection (PW_VSCODE_TEST_WS_URL)."
               )
             );
           }, 30_000);
@@ -374,12 +374,16 @@ export const test = base.extend<
         }
       }
 
-      // The injected VSCodeTestServer connects back to this URL.
+      // The extension host VSCodeTestServer connects back to this URL.
       env.PW_VSCODE_TEST_WS_URL = _rpcServer.url;
 
       // NOTE: VS Code's --extensionTestsPath must point at a JS file. We rely on `npm run compile-tests`
       // to produce `dist/` before running Playwright.
-      const injectedEntryPath = path.join(__dirname, "injected", "index.js");
+      const injectedEntryPath = path.join(
+        __dirname,
+        "vscodeTestServer",
+        "index.js"
+      );
 
       const videoOptions = normalizeVideoOptions(vscodeVideo);
       const shouldRecordVideo = videoOptions.mode !== "off";
@@ -564,7 +568,7 @@ export const test = base.extend<
     void vscodeTrace;
     void testInfo;
 
-    // The injected entrypoint connects back to our worker-scoped WebSocket server.
+    // The extension host entrypoint connects back to our worker-scoped WebSocket server.
     // Multiple connections are fine; for each test we use the next connection.
     void electronApp;
     const ws = await _rpcServer.waitForConnection();

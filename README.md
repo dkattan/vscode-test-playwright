@@ -5,7 +5,7 @@ Playwright Test fixtures for launching **Visual Studio Code (Electron)** and int
 This package wires up:
 
 - a Playwright `_electron` launch of VS Code (downloaded via `@vscode/test-electron` or using an existing install)
-- an injected “extension tests” entrypoint (`--extensionTestsPath=...`) that starts a small WebSocket JSON-RPC server inside VS Code
+- a VS Code extension host **test server entrypoint** (`--extensionTestsPath=...`) that connects back to the Playwright harness over WebSocket JSON-RPC
 - a Node-side client that lets your Playwright tests call `vscode.*` APIs, evaluate functions in the VS Code process, and keep remote objects alive via handles.
 
 It’s intended for **VS Code integration testing** (extensions, webviews, commands, editor interactions) while still benefiting from Playwright’s runner, reporting, retries, and trace tooling.
@@ -173,8 +173,8 @@ Useful knobs when running locally or in CI:
   - Best-effort VS Code install auto-discovery (opt-in).
 - `PW_VSCODE_DEBUG=1`
   - Enables verbose debug logging and mirrors VS Code stdout/stderr.
-- `PW_VSCODE_WAIT_FOR_LINE_TIMEOUT_MS`
-  - Timeout for waiting on VS Code to print the injected server URL.
+- `PW_VSCODE_TEST_WS_URL`
+  - **Internal:** WebSocket URL hosted by the Playwright harness. The extension host entrypoint connects to this.
 - `PW_VSCODE_ISOLATE_EXTENSIONS_DIR`
   - Defaults to isolating extensions for determinism; set to `0` to opt out.
 - `PW_TEST_DISABLE_TRACING`
@@ -198,8 +198,8 @@ This repo provides:
 
 1. The Playwright worker fixture downloads or locates a VS Code build.
 2. VS Code is launched via Playwright’s Electron support.
-3. VS Code is started with `--extensionTestsPath=dist/injected/index`, which runs a tiny server in the extension host.
-4. The Playwright side connects over WebSocket JSON-RPC and can:
+3. VS Code is started with `--extensionTestsPath=dist/vscodeTestServer/index`, which runs a tiny client+server in the extension host.
+4. The extension host connects back to the Playwright harness over WebSocket JSON-RPC and the Playwright side can:
    - call functions in the VS Code process (`evaluateInVSCode`)
    - return and manage remote objects via handles (`evaluateHandleInVSCode`)
    - subscribe to `EventEmitter` events
@@ -214,5 +214,6 @@ This repo provides:
   - When using `vscodeExecutablePath`, this harness needs the VS Code CLI location to be resolvable.
   - Prefer pointing `vscodeExecutablePath` at the actual Electron binary on macOS if you run into CLI resolution issues.
 
-- **Hangs waiting for server URL**
-  - Increase `PW_VSCODE_WAIT_FOR_LINE_TIMEOUT_MS`.
+- **Hangs waiting for extension host connection**
+  - The harness waits for the extension host to connect back to `PW_VSCODE_TEST_WS_URL`.
+  - Set `PW_VSCODE_DEBUG=1` and inspect `vscode-stdout`/`vscode-stderr` attachments under `test-results/`.

@@ -1,5 +1,5 @@
 /*
- * JSON-RPC payload types used between the harness (Playwright runner) and the injected VS Code extension host.
+ * JSON-RPC payload types used between the harness (Playwright runner) and the VS Code extension host entrypoint.
  */
 
 export const RPC = {
