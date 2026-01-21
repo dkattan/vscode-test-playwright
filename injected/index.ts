@@ -1,13 +1,10 @@
-
-import type { AddressInfo } from "node:net";
-import type { RawData, WebSocket } from "ws";
-import { createServer } from "node:http";
+import type { RawData } from "ws";
+import { WebSocket } from "ws";
 import * as vscode from "vscode";
 import {
   createMessageConnection,
   type MessageConnection,
 } from "vscode-jsonrpc";
-import { WebSocketServer } from "ws";
 import {
   WebSocketMessageReader,
   WebSocketMessageWriter,
@@ -220,22 +217,36 @@ class VSCodeTestServer {
 }
 
 export async function run() {
-  const server = createServer();
-  const wsServer = new WebSocketServer({ server });
-  try {
-    await new Promise<void>((r) => server.listen(0, r));
-    const address = server.address() as AddressInfo;
-    process.stderr.write(
-      `VSCodeTestServer listening on http://localhost:${address.port}\n`
+  const url = process.env.PW_VSCODE_TEST_WS_URL;
+  if (!url) {
+    throw new Error(
+      "PW_VSCODE_TEST_WS_URL was not set. The Playwright harness must provide the WebSocket server URL for the injected test server to connect to."
     );
-    const ws = await new Promise<WebSocket>((resolve, reject) => {
-      wsServer.once("connection", resolve);
-      wsServer.once("error", reject);
-    });
-    const testServer = new VSCodeTestServer(ws);
-    await testServer.run();
-  } finally {
-    wsServer.close();
-    server.close();
   }
+
+  process.stderr.write(`VSCodeTestServer connecting to ${url}\n`);
+
+  const ws = new WebSocket(url);
+
+  // IMPORTANT: Start the JSON-RPC listener immediately. The harness may begin
+  // sending requests as soon as the connection is established.
+  const testServer = new VSCodeTestServer(ws);
+  const runPromise = testServer.run();
+
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(
+      () => reject(new Error(`Timed out connecting to ${url}`)),
+      30_000
+    );
+    ws.once("open", () => {
+      clearTimeout(timeout);
+      resolve();
+    });
+    ws.once("error", (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+  });
+
+  await runPromise;
 }

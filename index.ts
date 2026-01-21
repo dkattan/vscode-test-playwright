@@ -30,7 +30,7 @@ import {
   downloadAndUnzipVSCode,
   resolveCliArgsFromVSCodeExecutablePath,
 } from "@vscode/test-electron";
-import { WebSocket } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import { VSCodeEvaluator as VSCodeEvaluatorImpl } from "./vscodeHandle";
 
 // NOTE: Export `expect` from this module for convenience. We bind it to the
@@ -101,6 +101,10 @@ interface ExperimentalVSCodeTestFixtures {
 interface InternalWorkerFixtures {
   _createTempDir: () => Promise<string>;
   _vscodeInstall: { installPath: string; cachePath: string };
+  _rpcServer: {
+    url: string;
+    waitForConnection: () => Promise<WebSocket>;
+  };
 }
 
 interface InternalTestFixtures {
@@ -172,93 +176,6 @@ function toEven(n: number) {
   return n % 2 === 0 ? n : n - 1;
 }
 
-async function allocateLocalPort(): Promise<number> {
-  throw new Error(
-    "allocateLocalPort is no longer used. The injected VSCodeTestServer binds to an ephemeral port and reports it via process output."
-  );
-}
-
-async function waitForLine(
-  childProcess: cp.ChildProcess,
-  regex: RegExp
-): Promise<RegExpMatchArray> {
-  return await new Promise((resolve, reject) => {
-    const rls = [
-      childProcess.stdout
-        ? {
-            source: "stdout",
-            rl: require("node:readline").createInterface({
-              input: childProcess.stdout,
-            }),
-          }
-        : undefined,
-      childProcess.stderr
-        ? {
-            source: "stderr",
-            rl: require("node:readline").createInterface({
-              input: childProcess.stderr,
-            }),
-          }
-        : undefined,
-    ].filter(Boolean) as Array<{
-      source: string;
-      rl: import("node:readline").Interface;
-    }>;
-
-    if (!rls.length) {
-      reject(
-        new Error(
-          `Process has no stdout/stderr streams; cannot wait for output matching ${regex}.`
-        )
-      );
-      return;
-    }
-
-    const cleanup = () => {
-      for (const { rl } of rls) {
-        try {
-          rl.close();
-        } catch {
-          // ignore
-        }
-      }
-      childProcess.off("exit", onExit);
-      childProcess.off("error", onError);
-    };
-
-    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
-      cleanup();
-      reject(
-        new Error(
-          `Process exited before emitting output matching ${regex} (code=${code}, signal=${signal}).`
-        )
-      );
-    };
-    const onError = (err: unknown) => {
-      cleanup();
-      reject(
-        new Error(
-          `Process emitted error before emitting output matching ${regex}: ${String(err)}`
-        )
-      );
-    };
-
-    childProcess.on("exit", onExit);
-    childProcess.on("error", onError);
-
-    for (const { rl } of rls) {
-      rl.on("line", (line: string) => {
-        const match = line.match(regex);
-        if (!match) {
-          return;
-        }
-        cleanup();
-        resolve(match);
-      });
-    }
-  });
-}
-
 export const test = base.extend<
   VSCodeTestFixtures &
     VSCodeTestOptions &
@@ -277,6 +194,96 @@ export const test = base.extend<
   ],
   extensionsDir: [undefined, { option: true, scope: "worker" }],
   userDataDir: [undefined, { option: true, scope: "worker" }],
+
+  _rpcServer: [
+    async ({}, use) => {
+      const sockets = new Set<WebSocket>();
+      const pending: WebSocket[] = [];
+      const waiters: Array<(socket: WebSocket) => void> = [];
+      const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+
+      wss.on("connection", (socket) => {
+        sockets.add(socket);
+        socket.on("close", () => sockets.delete(socket));
+
+        const waiter = waiters.shift();
+        if (waiter) {
+          waiter(socket);
+        } else {
+          pending.push(socket);
+        }
+      });
+
+      await new Promise<void>((resolve, reject) => {
+        wss.once("listening", () => resolve());
+        wss.once("error", (err) => reject(err));
+      });
+
+      const address = wss.address();
+      if (!address || typeof address === "string") {
+        throw new Error(
+          "WebSocketServer did not expose a TCP address. This harness requires host+port."
+        );
+      }
+
+      const url = `ws://127.0.0.1:${address.port}`;
+
+      const waitForConnection = async (): Promise<WebSocket> => {
+        const existing = pending.shift();
+        if (existing) {
+          return existing;
+        }
+
+        return await new Promise<WebSocket>((resolve, reject) => {
+          let onSocket: ((socket: WebSocket) => void) | undefined;
+          const timeout = setTimeout(() => {
+            if (onSocket) {
+              const idx = waiters.indexOf(onSocket);
+              if (idx >= 0) {
+                waiters.splice(idx, 1);
+              }
+            }
+            reject(
+              new Error(
+                "Timed out waiting for injected WebSocket connection (PW_VSCODE_TEST_WS_URL)."
+              )
+            );
+          }, 30_000);
+
+          onSocket = (socket: WebSocket) => {
+            clearTimeout(timeout);
+            resolve(socket);
+
+            // If this socket was already enqueued, remove it from pending.
+            const idx = pending.indexOf(socket);
+            if (idx >= 0) {
+              pending.splice(idx, 1);
+            }
+          };
+
+          waiters.push(onSocket);
+
+          // Ensure we don't leak a waiter on timeout.
+          timeout.unref?.();
+        });
+      };
+
+      try {
+        await use({ url, waitForConnection });
+      } finally {
+        for (const socket of sockets) {
+          try {
+            socket.close();
+          } catch {
+            // ignore
+          }
+        }
+
+        await new Promise<void>((resolve) => wss.close(() => resolve()));
+      }
+    },
+    { timeout: 0, scope: "worker" },
+  ],
 
   _vscodeInstall: [
     async (
@@ -346,6 +353,7 @@ export const test = base.extend<
         extensionDevelopmentPath,
         baseDir,
         _vscodeInstall,
+        _rpcServer,
         vscodeTrace,
         trace,
         extensionsDir,
@@ -365,6 +373,9 @@ export const test = base.extend<
           delete env[prop];
         }
       }
+
+      // The injected VSCodeTestServer connects back to this URL.
+      env.PW_VSCODE_TEST_WS_URL = _rpcServer.url;
 
       // NOTE: VS Code's --extensionTestsPath must point at a JS file. We rely on `npm run compile-tests`
       // to produce `dist/` before running Playwright.
@@ -545,7 +556,7 @@ export const test = base.extend<
   context: ({ electronApp }, use) => use(electronApp.context()),
 
   _evaluator: async (
-    { playwright, electronApp, vscodeTrace },
+    { playwright, electronApp, vscodeTrace, _rpcServer },
     use,
     testInfo
   ) => {
@@ -553,28 +564,22 @@ export const test = base.extend<
     void vscodeTrace;
     void testInfo;
 
-    // The injected server prints:
-    //   VSCodeTestServer listening on http://localhost:<port>
-    // We wait for that line on the VS Code process streams and connect.
-    const vscodeTestServerRegExp =
-      /^VSCodeTestServer listening on (http:\/\/.*)$/;
-    const proc = electronApp.process();
-    if (!proc) {
-      throw new Error("Expected ElectronApplication.process() to return a ChildProcess");
-    }
-    const match = await waitForLine(proc, vscodeTestServerRegExp);
-    const ws = new WebSocket(match[1]);
-    await new Promise<void>((r, reject) => {
-      ws.once("open", () => r());
-      ws.once("error", reject);
-    });
+    // The injected entrypoint connects back to our worker-scoped WebSocket server.
+    // Multiple connections are fine; for each test we use the next connection.
+    void electronApp;
+    const ws = await _rpcServer.waitForConnection();
     // Our current Playwright build no longer exposes the private tracing hooks
     // expected by the vendored evaluator (Tracing.onBeforeCall/onAfterCall).
     // Disable this integration; VS Code traces are still collected separately.
     const pageImpl = undefined;
     const evaluator = new VSCodeEvaluatorImpl(ws, pageImpl);
     await use(evaluator);
-    ws.close();
+
+    try {
+      ws.close();
+    } catch {
+      // ignore
+    }
   },
 
   _vscodeHandle: async ({ _evaluator }, use) => {
