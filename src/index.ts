@@ -1008,34 +1008,39 @@ export const test = base.extend<
 
   context: ({ electronApp }, use) => use(electronApp.context()),
 
-  _evaluator: async ({ electronApp }, use) => {
-    // NOTE: Avoid relying on Playwright internal APIs like `playwright._toImpl`,
-    // which are not stable across Playwright releases.
-
-    const process = electronApp.process();
-    if (!process) {
-      throw new Error("Could not access Electron child process for VS Code");
-    }
-
-    // Wait for URL to access VSCode test server.
+  _evaluator: async (
+    { playwright, electronApp, workbox, vscodeTrace },
+    use,
+    testInfo
+  ) => {
+    const electronAppImpl = await (playwright as any)._toImpl(electronApp);
+    const pageImpl = await (playwright as any)._toImpl(workbox);
+    // check recent logs or wait for URL to access VSCode test server
     const vscodeTestServerRegExp =
       /^VSCodeTestServer listening on (http:\/\/.*)$/;
-    debugLog(`waiting for test server line: ${vscodeTestServerRegExp}`);
-    const match = await waitForLine(process, vscodeTestServerRegExp);
-    debugLog(`matched test server line; url=${match[1]}`);
+    const process = electronAppImpl._process as cp.ChildProcess;
+    const recentLogs =
+      electronAppImpl._nodeConnection._browserLogsCollector.recentLogs() as string[];
+    let [match] = recentLogs
+      .map((s) => s.trim())
+      .map((s) => {
+        debugLog(`process output (recent): ${s}`);
+        return s;
+      })
+      .map((s) => s.match(vscodeTestServerRegExp))
+      .filter(Boolean);
+    debugLog(`vscode test server match: ${match ? match[1] : 'none (will wait)'}`);
+    if (!match) {
+      match = await waitForLine(process, vscodeTestServerRegExp);
+    }
     const ws = new WebSocket(match[1]);
-    ws.on("error", (e) => debugLog(`test server websocket error: ${String(e)}`));
-    ws.on("close", (code, reason) =>
-      debugLog(
-        `test server websocket closed: code=${code}, reason=${reason.toString()}`
-      )
-    );
     await new Promise((r) => ws.once("open", r));
-    debugLog(`test server websocket open`);
-    // Without access to Playwright internal Page implementation, tracing
-    // integration is disabled. Calls still work; they just won't be added to
-    // the trace timeline.
-    const evaluator = new VSCodeEvaluator(ws, undefined);
+    const traceMode = getTraceMode(vscodeTrace);
+    const captureTrace = shouldCaptureTrace(traceMode, testInfo);
+    const evaluator = new VSCodeEvaluator(
+      ws,
+      captureTrace ? pageImpl : undefined
+    );
     await use(evaluator);
     ws.close();
   },
