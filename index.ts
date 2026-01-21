@@ -379,7 +379,7 @@ export const test = base.extend<
 
       // NOTE: VS Code's --extensionTestsPath must point at a JS file. We rely on `npm run compile-tests`
       // to produce `dist/` before running Playwright.
-      const injectedEntryPath = path.join(
+      const testServerEntryPath = path.join(
         __dirname,
         "vscodeTestServer",
         "index.js"
@@ -452,7 +452,7 @@ export const test = base.extend<
             : []),
           `--extensions-dir=${resolvedExtensionsDir}`,
           `--user-data-dir=${resolvedUserDataDir}`,
-          `--extensionTestsPath=${injectedEntryPath}`,
+          `--extensionTestsPath=${testServerEntryPath}`,
           ...(extensionDevelopmentPath
             ? [`--extensionDevelopmentPath=${extensionDevelopmentPath}`]
             : []),
