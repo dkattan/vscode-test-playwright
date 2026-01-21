@@ -6,6 +6,7 @@
     "allowSyntheticDefaultImports": false,
     "target": "ESNext",
     "noImplicitAny": true,
+    "skipLibCheck": true,
     "sourceMap": true,
     "outDir": "dist",
     "baseUrl": ".",

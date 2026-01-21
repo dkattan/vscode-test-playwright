@@ -27,10 +27,9 @@ import {
   VSCodeFunctionOn,
   VSCodeHandle,
 } from "./vscodeHandle";
-export { expect } from "@playwright/test";
 
 function debugEnabled(): boolean {
-  return process.env.PW_VSCODE_DEBUG === "1";
+  return process.env.PW_VSCODE_DEBUG === "1" || process.env.CI === "1";
 }
 
 function debugLog(message: string) {
@@ -526,7 +525,7 @@ export const test = base.extend<
       });
 
       // Helpful for CI diagnostics: this prints once per worker.
-      console.log(
+      debugLog(
         `[vscode-test-playwright] downloadAndUnzipVSCode returned: ${installPath}` +
         (downloadedPath
           ? ` (downloadedPath: ${downloadedPath})`
@@ -1140,3 +1139,8 @@ export const test = base.extend<
     { timeout: 0 },
   ],
 });
+
+// Export a context-aware expect bound to this test instance.
+// This avoids subtle version/context mismatches where `expect.soft(...)` may
+// not have access to the current TestInfo.
+export const expect = test.expect;

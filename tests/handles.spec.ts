@@ -1,11 +1,29 @@
 import { expect, test } from 'vscode-test-playwright';
 import type { Disposable } from 'vscode';
 
+async function expectThrowsOrRejectsWithMessage(
+  fn: () => unknown | Promise<unknown>,
+  message: string
+) {
+  try {
+    await fn();
+    throw new Error(
+      `Expected function to throw/reject with message containing: ${message}`
+    );
+  } catch (e: unknown) {
+    const err = e as { message?: string };
+    expect(err?.message ?? String(e)).toContain(message);
+  }
+}
+
 test('should fail when calling released handle', async ({ evaluateHandleInVSCode }) => {
   const arrayHandle = await evaluateHandleInVSCode(() => [] as string[]);
   expect(await arrayHandle.evaluate(arr => arr.push('hello'))).toBe(1);
   await arrayHandle.release();
-  await expect(async () => await arrayHandle.evaluate(arr => arr.push('hello'))).rejects.toThrowError('Handle is released');
+  await expectThrowsOrRejectsWithMessage(
+    () => arrayHandle.evaluate(arr => arr.push('hello')),
+    'Handle is released'
+  );
 });
 
 test('should free remote object from released handle', async ({ evaluateHandleInVSCode, evaluateInVSCode }) => {
@@ -54,11 +72,17 @@ test('should release and dispose handle for disposable', async ({ evaluateHandle
 });
 
 test('should throw', async ({ evaluateInVSCode, evaluateHandleInVSCode }) => {
-  await expect.soft(evaluateInVSCode(() => {
-    throw new Error('oops');
-  })).rejects.toThrowError('oops');
+  await expectThrowsOrRejectsWithMessage(
+    () => evaluateInVSCode(() => {
+      throw new Error('oops');
+    }),
+    'oops'
+  );
 
-  await expect.soft(evaluateHandleInVSCode(() => {
-    throw new Error('oops handle');
-  })).rejects.toThrowError('oops handle');
+  await expectThrowsOrRejectsWithMessage(
+    () => evaluateHandleInVSCode(() => {
+      throw new Error('oops handle');
+    }),
+    'oops handle'
+  );
 });

@@ -60,9 +60,12 @@ log "Launching container..."
 CONTAINER_NAME="vscode-test-playwright-$(date +%s)-$$"
 
 docker run --rm -t --ipc=host --name "${CONTAINER_NAME}" \
+  --user pwuser \
   -v "${ROOT_DIR}:/work" \
   -w /work \
   -e CI=1 \
+  -e HOME=/home/pwuser \
+  -e npm_config_cache=/tmp/npm-cache \
   -e PW_TEST_TIMEOUT_MS="${PW_TEST_TIMEOUT_MS}" \
   -e PW_GLOBAL_TIMEOUT_MS="${PW_GLOBAL_TIMEOUT_MS}" \
   "${IMAGE}" \

@@ -1,9 +1,29 @@
 import type * as vscode from 'vscode';
 import type { EventEmitter, Disposable } from 'vscode';
+import {
+  createMessageConnection,
+  type MessageConnection,
+} from 'vscode-jsonrpc';
 import { WebSocket } from 'ws';
-import { MessageRequestDataMap, MessageResponseDataMap, ResponseMessage, VSCodeHandleObject } from './protocol';
+import {
+  WebSocketMessageReader,
+  WebSocketMessageWriter,
+  type WsLike,
+} from './jsonRpcWsTransport';
+import {
+  type DispatchEventParams,
+  type InvokeMethodParams,
+  type InvokeMethodResult,
+  type RegisterEventParams,
+  type ReleaseParams,
+  RPC,
+} from './rpcTypes';
 
 export type VSCode = typeof vscode;
+
+type VSCodeHandleObject =
+  | { __vscodeHandle: true; objectId: number }
+  | { __vscodeHandle: 'eventEmitter'; objectId: number };
 
 export type Unboxed<Arg> =
   Arg extends ObjectHandle<infer T> ? T :
@@ -21,89 +41,34 @@ export type VSCodeFunctionOn<On, Arg2, R> = (on: On, arg2: Unboxed<Arg2>) => R |
 export type VSCodeHandle<T> = T extends EventEmitter<infer R> ? EventEmitterHandle<R> : ObjectHandle<T>;
 
 export class VSCodeEvaluator {
-  private _lastId = 0;
   private _ws: WebSocket;
-  private _pending = new Map<number, { resolve: Function, reject: Function }>();
+  private readonly _connection: MessageConnection;
   private _cache = new Map<number, ObjectHandle<unknown>>();
   private _listeners = new Map<number, Set<((event?: any) => any)>>();
   private _page: any;
 
-  private _responseHandler = (json: string) => {
-    const { op, id, data } = JSON.parse(json) as ResponseMessage;
-
-    if (op === 'dispatchEvent') {
-      const { objectId, event } = data as MessageResponseDataMap['dispatchEvent'];
-      if (objectId === undefined)
-        throw new Error(`Missing objectId for response op 'dispatchEvent'`);
-      const listeners = this._listeners.get(objectId);
-      if (listeners) {
-        for (const listener of listeners)
-          listener(event);
-      }
-      return;
-    }
-
-    if (id === undefined)
-      throw new Error(`Missing request id for response op '${op}'`);
-
-    if (!this._pending.has(id))
-      throw new Error(`Could not find promise for request with ID ${id}`);
-
-    const pending = this._pending.get(id);
-    if (!pending)
-      throw new Error(`Could not find promise for request with ID ${id}`);
-
-    const { resolve, reject } = pending;
-    this._pending.delete(id);
-
-    switch (op) {
-      case 'release':
-      case 'registerEvent':
-      case 'unregisterEvent': {
-        resolve();
-        return;
-      }
-      case 'invokeMethod': {
-        const { error, result } = data as MessageResponseDataMap['invokeMethod'];
-        if (error) {
-          const e = new Error(error.message);
-          e.stack = error.stack;
-          reject(e);
-        } else {
-          resolve({ result });
-        }
-        return;
-      }
-    }
-  };
-
   constructor(ws: WebSocket, pageImpl: any) {
     this._ws = ws;
     this._page = pageImpl;
-    this._ws.on('message', data => this._responseHandler(data.toString()));
 
-    const rejectAllPending = (reason: unknown) => {
-      for (const [id, { reject }] of this._pending.entries()) {
-        try {
-          reject(reason instanceof Error ? reason : new Error(String(reason)));
-        } catch {
-          // ignore
+    const reader = new WebSocketMessageReader(ws as unknown as WsLike);
+    const writer = new WebSocketMessageWriter(ws as unknown as WsLike);
+    this._connection = createMessageConnection(reader, writer);
+
+    this._connection.onNotification(
+      RPC.dispatchEvent,
+      (p: DispatchEventParams) => {
+        const { objectId, event } = p;
+        const listeners = this._listeners.get(objectId);
+        if (listeners) {
+          for (const listener of listeners) {
+            listener(event);
+          }
         }
       }
-      this._pending.clear();
-    };
+    );
 
-    this._ws.on('close', (code, reason) => {
-      rejectAllPending(
-        new Error(
-          `VSCode test server websocket closed (code=${code}, reason=${reason.toString()})`
-        )
-      );
-    });
-
-    this._ws.on('error', (err) => {
-      rejectAllPending(err);
-    });
+    this._connection.listen();
 
     this._cache.set(0, new ObjectHandle(0, this));
   }
@@ -128,7 +93,19 @@ export class VSCodeEvaluator {
     }
 
     const params = arg !== undefined ? [toParam(arg)] : [];
-    const { result } = await this._sendAndWaitWithTrace('invokeMethod', { objectId, returnHandle, fn: fn.toString(), params });
+    const response = await this._sendRequestWithTrace<InvokeMethodParams, InvokeMethodResult>(
+      RPC.invokeMethod,
+      { objectId, returnHandle, fn: fn.toString(), params }
+    );
+    if (response.error) {
+      const e = new Error(response.error.message);
+      (e as any).name = response.error.name ?? e.name;
+      if (response.error.stack)
+        e.stack = response.error.stack;
+      throw e;
+    }
+
+    const { result } = response;
     if (!returnHandle)
       return result;
 
@@ -154,7 +131,7 @@ export class VSCodeEvaluator {
       return;
 
     listeners.add(listener);
-    await this._sendAndWait('registerEvent', { objectId });
+    await this._sendRequest<RegisterEventParams, void>(RPC.registerEvent, { objectId });
   }
 
   async removeListener<R>(objectId: number, listener: (event: R) => any) {
@@ -162,38 +139,41 @@ export class VSCodeEvaluator {
     if (!listeners?.has(listener))
       return
     listeners.delete(listener);
-    await this._sendAndWait('unregisterEvent', { objectId });
+    await this._sendRequest<RegisterEventParams, void>(RPC.unregisterEvent, { objectId });
   }
 
   async release(objectId: number, options?: { dispose?: boolean }) {
     this._listeners.delete(objectId);
     if (!this._cache.delete(objectId))
       return;
-    await this._sendAndWaitWithTrace('release', { objectId, ...options });
+    await this._sendRequestWithTrace<ReleaseParams, void>(RPC.release, { objectId, ...options });
   }
 
   async dispose() {
     await Promise.all([...this._cache.keys()].map(objectId => this.release(objectId))).catch(() => { });
-    this._ws.removeListener('data', this._responseHandler);
-    for (const [id, { reject }] of this._pending.entries())
-      reject(new Error(`No response for request ${id} received from VSCode`));
+    this._connection.dispose();
   }
 
-  private async _sendAndWait<K extends keyof MessageRequestDataMap>(op: K, data: MessageRequestDataMap[K]): Promise<MessageResponseDataMap[K]> {
+  private async _sendRequest<TParams, TResult>(
+    method: string,
+    params: TParams
+  ): Promise<TResult> {
     // Avoid hanging forever: if the socket is not open, fail immediately.
     if (this._ws.readyState !== this._ws.OPEN) {
       throw new Error(
-        `Cannot send '${String(op)}' to VS Code test server: websocket not open (readyState=${this._ws.readyState})`
+        `Cannot send '${String(method)}' to VS Code test server: websocket not open (readyState=${this._ws.readyState})`
       );
     }
-    const id = ++this._lastId;
-    this._ws.send(JSON.stringify({ op, id, data }));
-    return await new Promise((resolve, reject) => this._pending.set(id, { resolve, reject }));
+
+    return (await this._connection.sendRequest(method, params as any)) as TResult;
   }
 
-  private async _sendAndWaitWithTrace<K extends keyof MessageRequestDataMap>(op: K, data: MessageRequestDataMap[K]): Promise<MessageResponseDataMap[K]> {
+  private async _sendRequestWithTrace<TParams, TResult>(
+    method: string,
+    params: TParams
+  ): Promise<TResult> {
     if (!this._page)
-      return await this._sendAndWait(op, data);
+      return await this._sendRequest<TParams, TResult>(method, params);
 
     const getGuid = (obj: any): string | undefined => {
       // Different Playwright objects expose guid differently across layers/versions.
@@ -205,13 +185,19 @@ export class VSCodeEvaluator {
     const tracing = this._page?.context?.()?.tracing;
     const frame = this._page?.mainFrame?.();
     if (!tracing || !frame || typeof tracing.onBeforeCall !== 'function' || typeof tracing.onAfterCall !== 'function')
-      return await this._sendAndWait(op, data);
+      return await this._sendRequest<TParams, TResult>(method, params);
 
     const { monotonicTime, createGuid } = require('playwright-core/lib/utils');
     const frameGuid = getGuid(frame);
     const pageGuid = getGuid(this._page);
+    const traceMethod =
+      method === RPC.invokeMethod && (params as any)?.returnHandle
+        ? 'evaluateHandle'
+        : method === RPC.invokeMethod
+          ? 'evaluate'
+          : String(method);
     const metadata = {
-      id: `vscodecall@${(data as any).id ?? createGuid()}`,
+      id: `vscodecall@${createGuid()}`,
       startTime: monotonicTime(),
       endTime: 0,
       // prevents pause action from being written into calllogs
@@ -220,14 +206,14 @@ export class VSCodeEvaluator {
       pageId: pageGuid,
       frameId: frameGuid,
       type: 'vscodeHandle',
-      method: (data as MessageRequestDataMap['invokeMethod'])?.returnHandle ? 'evaluateHandle' : 'evaluate',
-      params: { op, data },
+      method: traceMethod,
+      params: { method, params },
       log: [] as string[],
     };
     await tracing.onBeforeCall(frame, metadata);
     let error: any, result: any;
     try {
-      result = await this._sendAndWait(op, data);
+      result = await this._sendRequest<TParams, TResult>(method, params);
       return result;
     } catch (e) {
       const err = e as any;
