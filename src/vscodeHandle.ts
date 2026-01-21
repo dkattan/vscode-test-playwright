@@ -173,7 +173,7 @@ export class VSCodeEvaluator {
   }
 
   async dispose() {
-    await Promise.all([...this._cache.keys()].map(objectId => this.release(objectId))).catch(() => {});
+    await Promise.all([...this._cache.keys()].map(objectId => this.release(objectId))).catch(() => { });
     this._ws.removeListener('data', this._responseHandler);
     for (const [id, { reject }] of this._pending.entries())
       reject(new Error(`No response for request ${id} received from VSCode`));

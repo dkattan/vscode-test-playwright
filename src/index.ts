@@ -1028,8 +1028,8 @@ export const test = base.extend<
     if (!electronAppImpl) {
       throw new Error(
         `Unable to access Playwright internal implementation objects. ` +
-          `This is required for trace integration. ` +
-          `Set PW_VSCODE_DEBUG=1 for more details.`
+        `This is required for trace integration. ` +
+        `Set PW_VSCODE_DEBUG=1 for more details.`
       );
     }
     // check recent logs or wait for URL to access VSCode test server
