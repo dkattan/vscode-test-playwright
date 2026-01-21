@@ -20,12 +20,37 @@ export default defineConfig<VSCodeTestOptions, VSCodeWorkerOptions>({
       use: {
         vscodeVersion: 'insiders',
       },
+      // Keep upstream tests as-is; exclude Copilot Chat repro.
+      testIgnore: /copilotChat\.spec\.ts/,
     },
     {
       name: 'release',
       use: {
         vscodeVersion: '1.92.2',
       },
+      // Keep upstream tests as-is; exclude Copilot Chat repro.
+      testIgnore: /copilotChat\.spec\.ts/,
+    },
+    {
+      // Experimental repro target: mimic the demo repo's setup.
+      // - stable VS Code
+      // - marketplace Copilot extensions installed
+      // - open a real workspace
+      name: 'stable-with-copilot-chat',
+      use: {
+        vscodeVersion: 'stable',
+        vscodeTrace: 'off',
+        extensions: ['github.copilot', 'github.copilot-chat'],
+        baseDir: path.join(
+          __dirname,
+          'tests',
+          'workspaces',
+          'copilot-chat',
+          'copilot-chat.code-workspace'
+        ),
+      },
+      // Only run the Copilot Chat repro test in this project.
+      testMatch: /copilotChat\.spec\.ts/,
     },
   ],
 });
