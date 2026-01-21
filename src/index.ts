@@ -39,6 +39,21 @@ function debugLog(message: string) {
   console.log(`[vscode-test-playwright][debug] ${message}`);
 }
 
+function toImpl<T>(playwright: any, apiObject: T): any {
+  // Playwright internals changed over time:
+  // - older versions exposed playwright._toImpl(apiObject)
+  // - newer versions expose connection.toImpl(apiObject)
+  // We use whichever is available.
+  const pw = playwright as any;
+  if (pw?._toImpl) return pw._toImpl(apiObject);
+
+  const obj: any = apiObject as any;
+  const conn = obj?._connection ?? pw?._connection;
+  if (conn?.toImpl) return conn.toImpl(apiObject);
+
+  return undefined;
+}
+
 export type VSCodeWorkerOptions = {
   vscodeVersion: string;
   /**
@@ -55,14 +70,14 @@ export type VSCodeWorkerOptions = {
   vscodeExecutablePath?: string;
   extensions?: string | string[];
   vscodeTrace:
-    | TraceMode
-    | {
-        mode: TraceMode;
-        snapshots?: boolean;
-        screenshots?: boolean;
-        sources?: boolean;
-        attachments?: boolean;
-      };
+  | TraceMode
+  | {
+    mode: TraceMode;
+    snapshots?: boolean;
+    screenshots?: boolean;
+    sources?: boolean;
+    attachments?: boolean;
+  };
   extensionsDir?: string;
   userDataDir?: string;
 };
@@ -133,12 +148,12 @@ function getTraceMode(
     | TraceMode
     | "retry-with-trace"
     | {
-        mode: TraceMode;
-        snapshots?: boolean;
-        screenshots?: boolean;
-        sources?: boolean;
-        attachments?: boolean;
-      }
+      mode: TraceMode;
+      snapshots?: boolean;
+      screenshots?: boolean;
+      sources?: boolean;
+      attachments?: boolean;
+    }
 ) {
   const traceMode = typeof trace === "string" ? trace : trace.mode;
   if (traceMode === "retry-with-trace") return "on-first-retry";
@@ -261,7 +276,7 @@ function waitForLine(
 
     const failError = new Error(
       `Process failed to launch while waiting for output matching ${regex}.\n` +
-        `Recent output (last ${maxRecentLines} lines max):\n${formatRecent()}`
+      `Recent output (last ${maxRecentLines} lines max):\n${formatRecent()}`
     );
 
     let finished = false;
@@ -275,27 +290,27 @@ function waitForLine(
 
     const timer = timeoutMs
       ? setTimeout(() => {
-          finishReject(
-            new Error(
-              `Timed out after ${timeoutMs}ms waiting for process output matching ${regex}.\n` +
-                `Recent output (last ${maxRecentLines} lines max):\n${formatRecent()}`
-            )
-          );
-        }, timeoutMs)
+        finishReject(
+          new Error(
+            `Timed out after ${timeoutMs}ms waiting for process output matching ${regex}.\n` +
+            `Recent output (last ${maxRecentLines} lines max):\n${formatRecent()}`
+          )
+        );
+      }, timeoutMs)
       : undefined;
 
     const rls = [
       childProcess.stdout
         ? {
-            source: "stdout",
-            rl: readline.createInterface({ input: childProcess.stdout }),
-          }
+          source: "stdout",
+          rl: readline.createInterface({ input: childProcess.stdout }),
+        }
         : undefined,
       childProcess.stderr
         ? {
-            source: "stderr",
-            rl: readline.createInterface({ input: childProcess.stderr }),
-          }
+          source: "stderr",
+          rl: readline.createInterface({ input: childProcess.stderr }),
+        }
         : undefined,
     ].filter(Boolean) as Array<{ source: string; rl: readline.Interface }>;
 
@@ -316,7 +331,7 @@ function waitForLine(
         finishReject(
           new Error(
             `Process exited before emitting output matching ${regex} (code=${code}, signal=${signal}).\n` +
-              `Recent output (last ${maxRecentLines} lines max):\n${formatRecent()}`
+            `Recent output (last ${maxRecentLines} lines max):\n${formatRecent()}`
           )
         );
       }),
@@ -325,7 +340,7 @@ function waitForLine(
         finishReject(
           new Error(
             `Process emitted error before emitting output matching ${regex}: ${String(err)}\n` +
-              `Recent output (last ${maxRecentLines} lines max):\n${formatRecent()}`
+            `Recent output (last ${maxRecentLines} lines max):\n${formatRecent()}`
           )
         );
       }),
@@ -369,9 +384,9 @@ function waitForLine(
 
 export const test = base.extend<
   VSCodeTestFixtures &
-    VSCodeTestOptions &
-    InternalTestFixtures &
-    ExperimentalVSCodeTestFixtures,
+  VSCodeTestOptions &
+  InternalTestFixtures &
+  ExperimentalVSCodeTestFixtures,
   VSCodeWorkerOptions & InternalWorkerFixtures
 >({
   vscodeVersion: ["insiders", { option: true, scope: "worker" }],
@@ -441,8 +456,8 @@ export const test = base.extend<
           if (!fs.existsSync(cliPath)) {
             throw new Error(
               `VS Code CLI not found at resolved path: ${cliPath}. ` +
-                `PW_VSCODE_EXECUTABLE_PATH/vscodeExecutablePath resolved to: ${explicitExecutablePath}. ` +
-                `This path is required to install extensions (e.g. github.copilot-chat).`
+              `PW_VSCODE_EXECUTABLE_PATH/vscodeExecutablePath resolved to: ${explicitExecutablePath}. ` +
+              `This path is required to install extensions (e.g. github.copilot-chat).`
             );
           }
 
@@ -452,11 +467,9 @@ export const test = base.extend<
             const subProcess = cp.spawn(
               cliPath,
               [
-                `--extensions-dir=${
-                  extensionsDir ?? path.join(cachePath, "extensions")
+                `--extensions-dir=${extensionsDir ?? path.join(cachePath, "extensions")
                 }`,
-                `--user-data-dir=${
-                  userDataDir ?? path.join(cachePath, "user-data")
+                `--user-data-dir=${userDataDir ?? path.join(cachePath, "user-data")
                 }`,
                 ...extensions.flatMap((extension) => [
                   "--install-extension",
@@ -515,17 +528,17 @@ export const test = base.extend<
       // Helpful for CI diagnostics: this prints once per worker.
       console.log(
         `[vscode-test-playwright] downloadAndUnzipVSCode returned: ${installPath}` +
-          (downloadedPath
-            ? ` (downloadedPath: ${downloadedPath})`
-            : " (downloadedPath unavailable)")
+        (downloadedPath
+          ? ` (downloadedPath: ${downloadedPath})`
+          : " (downloadedPath unavailable)")
       );
       const [cliPath] = resolveCliArgsFromVSCodeExecutablePath(installPath);
 
       if (!fs.existsSync(cliPath)) {
         throw new Error(
           `VS Code CLI not found at resolved path: ${cliPath}. ` +
-            `downloadAndUnzipVSCode returned: ${installPath}. ` +
-            `This path is required to install extensions (e.g. github.copilot-chat).`
+          `downloadAndUnzipVSCode returned: ${installPath}. ` +
+          `This path is required to install extensions (e.g. github.copilot-chat).`
         );
       }
 
@@ -536,11 +549,9 @@ export const test = base.extend<
           const subProcess = cp.spawn(
             cliPath,
             [
-              `--extensions-dir=${
-                extensionsDir ?? path.join(cachePath, "extensions")
+              `--extensions-dir=${extensionsDir ?? path.join(cachePath, "extensions")
               }`,
-              `--user-data-dir=${
-                userDataDir ?? path.join(cachePath, "user-data")
+              `--user-data-dir=${userDataDir ?? path.join(cachePath, "user-data")
               }`,
               ...extensions.flatMap((extension) => [
                 "--install-extension",
@@ -654,10 +665,10 @@ export const test = base.extend<
         if (!fs.existsSync(pathForResolution)) {
           throw new Error(
             `VS Code installPath does not exist: ${pathForResolution}. ` +
-              `downloadAndUnzipVSCode returned: ${installPath}. ` +
-              (downloadedPath
-                ? `Progress reporter downloadedPath: ${downloadedPath}. `
-                : "Progress reporter downloadedPath not available. ")
+            `downloadAndUnzipVSCode returned: ${installPath}. ` +
+            (downloadedPath
+              ? `Progress reporter downloadedPath: ${downloadedPath}. `
+              : "Progress reporter downloadedPath not available. ")
           );
         }
 
@@ -683,7 +694,7 @@ export const test = base.extend<
           if (!fs.existsSync(candidate)) {
             throw new Error(
               `VS Code Electron executable not found at expected path: ${candidate}. ` +
-                `Resolved installPath: ${pathForResolution}`
+              `Resolved installPath: ${pathForResolution}`
             );
           }
           return candidate;
@@ -695,11 +706,11 @@ export const test = base.extend<
           const candidates =
             platform === "win32"
               ? [
-                  "Code.exe",
-                  "Code - Insiders.exe",
-                  "code.exe",
-                  path.join("bin", "code.cmd"),
-                ]
+                "Code.exe",
+                "Code - Insiders.exe",
+                "code.exe",
+                path.join("bin", "code.cmd"),
+              ]
               : ["code", "code-insiders"];
 
           for (const rel of candidates) {
@@ -711,13 +722,13 @@ export const test = base.extend<
 
           throw new Error(
             `VS Code executable not found under installPath directory: ${pathForResolution}. ` +
-              `Tried: ${candidates.join(", ")}`
+            `Tried: ${candidates.join(", ")}`
           );
         }
 
         throw new Error(
           `Unsupported VS Code installPath type for: ${pathForResolution}. ` +
-            `Expected a file or directory.`
+          `Expected a file or directory.`
         );
       })();
 
@@ -759,11 +770,11 @@ export const test = base.extend<
         env,
         ...(captureVideo
           ? {
-              recordVideo: {
-                dir: videoDir!,
-                ...(videoSize ? { size: videoSize } : {}),
-              },
-            }
+            recordVideo: {
+              dir: videoDir!,
+              ...(videoSize ? { size: videoSize } : {}),
+            },
+          }
           : {}),
         args: [
           ...platformArgs,
@@ -1013,8 +1024,14 @@ export const test = base.extend<
     use,
     testInfo
   ) => {
-    const electronAppImpl = await (playwright as any)._toImpl(electronApp);
-    const pageImpl = await (playwright as any)._toImpl(workbox);
+    const electronAppImpl = toImpl(playwright as any, electronApp);
+    if (!electronAppImpl) {
+      throw new Error(
+        `Unable to access Playwright internal implementation objects. ` +
+          `This is required for trace integration. ` +
+          `Set PW_VSCODE_DEBUG=1 for more details.`
+      );
+    }
     // check recent logs or wait for URL to access VSCode test server
     const vscodeTestServerRegExp =
       /^VSCodeTestServer listening on (http:\/\/.*)$/;
@@ -1039,7 +1056,7 @@ export const test = base.extend<
     const captureTrace = shouldCaptureTrace(traceMode, testInfo);
     const evaluator = new VSCodeEvaluator(
       ws,
-      captureTrace ? pageImpl : undefined
+      captureTrace ? workbox : undefined
     );
     await use(evaluator);
     ws.close();
@@ -1082,7 +1099,7 @@ export const test = base.extend<
   },
 
   _createTempDir: [
-    async ({}, use) => {
+    async ({ }, use) => {
       const tempDirs: string[] = [];
       await use(async () => {
         const tempDir = await fs.promises.realpath(

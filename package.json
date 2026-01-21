@@ -4,7 +4,9 @@
   "scripts": {
     "build": "tsc",
     "watch": "tsc --watch",
-    "test": "playwright test"
+    "pretest": "npm run -s build",
+    "test": "playwright test",
+    "test:linux": "bash ./scripts/test-linux.sh"
   },
   "keywords": [],
   "author": "",
@@ -20,14 +22,14 @@
     "./package.json": "./package.json"
   },
   "devDependencies": {
-    "@playwright/test": "^1.52.0",
-    "@types/node": "^22.15.29",
-    "@types/vscode": "^1.100.0",
+    "@playwright/test": "^1.57.0",
+    "@types/node": "^25.0.9",
+    "@types/vscode": "^1.108.1",
     "@types/ws": "^8.18.1",
-    "typescript": "^5.8.3"
+    "typescript": "^5.9.3"
   },
   "dependencies": {
     "@vscode/test-electron": "^2.5.2",
-    "ws": "^8.18.2"
+    "ws": "^8.19.0"
   }
 }

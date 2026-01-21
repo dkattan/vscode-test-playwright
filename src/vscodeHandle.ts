@@ -195,18 +195,30 @@ export class VSCodeEvaluator {
     if (!this._page)
       return await this._sendAndWait(op, data);
 
+    const getGuid = (obj: any): string | undefined => {
+      // Different Playwright objects expose guid differently across layers/versions.
+      return obj?.guid ?? obj?._guid ?? obj?._object?._guid;
+    };
+
+    // If we're not dealing with a client-side Page object that has the tracing
+    // instrumentation hooks, fall back to a normal send (no custom call log).
+    const tracing = this._page?.context?.()?.tracing;
+    const frame = this._page?.mainFrame?.();
+    if (!tracing || !frame || typeof tracing.onBeforeCall !== 'function' || typeof tracing.onAfterCall !== 'function')
+      return await this._sendAndWait(op, data);
+
     const { monotonicTime, createGuid } = require('playwright-core/lib/utils');
-    const tracing = this._page.context().tracing;
-    const frame = this._page.mainFrame();
+    const frameGuid = getGuid(frame);
+    const pageGuid = getGuid(this._page);
     const metadata = {
       id: `vscodecall@${(data as any).id ?? createGuid()}`,
       startTime: monotonicTime(),
       endTime: 0,
       // prevents pause action from being written into calllogs
       internal: false,
-      objectId: frame.guid,
-      pageId: this._page.guid,
-      frameId: frame.guid,
+      objectId: frameGuid,
+      pageId: pageGuid,
+      frameId: frameGuid,
       type: 'vscodeHandle',
       method: (data as MessageRequestDataMap['invokeMethod'])?.returnHandle ? 'evaluateHandle' : 'evaluate',
       params: { op, data },
