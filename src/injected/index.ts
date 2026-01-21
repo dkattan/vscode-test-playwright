@@ -139,7 +139,7 @@ export async function run() {
   try {
     await new Promise<void>(r => server.listen(0, r));
     const address = server.address() as AddressInfo;
-    process.stderr.write(`VSCodeTestServer listening on http://localhost:${address.port}\n`);
+    process.stdout.write(`VSCodeTestServer listening on http://localhost:${address.port}\n`);
     const ws = await new Promise<WebSocket>((resolve, reject) => {
       wsServer.once('connection', resolve);
       wsServer.once('error', reject);

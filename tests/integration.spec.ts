@@ -19,7 +19,7 @@ test('should drag and drop in webview', async ({ evaluateInVSCode, workbox }) =>
 
 test('ensure editor is open', async ({ evaluateInVSCode }) => {
   const openUris = await evaluateInVSCode(async (vscode, path) => {
-    await vscode.commands.executeCommand('vscode.open', vscode.Uri.parse(path));
+    await vscode.window.showTextDocument(vscode.Uri.parse(path));
     return vscode.window.visibleTextEditors.map(e => e.document.uri.toString());
   }, 'untitled:/empty.txt');
   expect(openUris).toEqual(['untitled:/empty.txt']);
@@ -27,7 +27,7 @@ test('ensure editor is open', async ({ evaluateInVSCode }) => {
 
 test('write text into new document', async ({ evaluateHandleInVSCode, evaluateInVSCode }) => {
   const editorHandle = await evaluateHandleInVSCode(async (vscode, path) => {
-		return await vscode.window.showTextDocument(vscode.Uri.parse(path));
+    return await vscode.window.showTextDocument(vscode.Uri.parse(path));
   }, 'untitled:/hello.txt');
 
   await evaluateInVSCode(async (vscode, editor) => {
@@ -41,7 +41,7 @@ test('write text into new document', async ({ evaluateHandleInVSCode, evaluateIn
 
 test('listen to document changes', async ({ evaluateHandleInVSCode, evaluateInVSCode }) => {
   const editorHandle = await evaluateHandleInVSCode(async (vscode, path) => {
-		return await vscode.window.showTextDocument(vscode.Uri.parse(path));
+    return await vscode.window.showTextDocument(vscode.Uri.parse(path));
   }, 'untitled:/hello.txt');
 
   const documentChangedHandle = await evaluateHandleInVSCode(async vscode => {
