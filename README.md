@@ -1,270 +1,218 @@
-# VS Code Tests for Playwright
+# vscode-test-playwright
 
-This module allows running VS Code extension tests with [playwright](https://github.com/microsoft/playwright/).
-It allows both VS Code API and UI to be tested simultaneously by combining:
+Playwright Test fixtures for launching **Visual Studio Code (Electron)** and interacting with the **VS Code extension host** from your tests.
 
-- [@vscode/test-electron](https://code.visualstudio.com/api/working-with-extensions/testing-extension#advanced-setup-your-own-runner) with a custom runner that exposes a server that allows evaluating code inside VS Code
-- [@playwright/test](https://playwright.dev/docs/writing-tests) that launches VSCode electron app and allows interactions with VS Code UI using VSCode, as well as evaluating functions in VS Code context
+This package wires up:
 
-> [!NOTE]
-> Not to be confused with [Playwright Test for VS Code](https://github.com/microsoft/playwright-vscode).
+- a Playwright `_electron` launch of VS Code (downloaded via `@vscode/test-electron` or using an existing install)
+- an injected “extension tests” entrypoint (`--extensionTestsPath=...`) that starts a small WebSocket JSON-RPC server inside VS Code
+- a Node-side client that lets your Playwright tests call `vscode.*` APIs, evaluate functions in the VS Code process, and keep remote objects alive via handles.
 
-## Example
+It’s intended for **VS Code integration testing** (extensions, webviews, commands, editor interactions) while still benefiting from Playwright’s runner, reporting, retries, and trace tooling.
 
-Let's show some kitten love:
+## What you get
 
-![Paw Draw!](docs/assets/paw_draw.gif)
+- ✅ Launch VS Code **release**, **insiders**, or **stable** via `@vscode/test-electron`
+- ✅ Optionally launch a **user-provided VS Code install** (`vscodeExecutablePath` / `PW_VSCODE_EXECUTABLE_PATH`)
+- ✅ Install extensions for a run (e.g. `github.copilot`, `github.copilot-chat`) via `--install-extension`
+- ✅ A `test` fixture with helpers:
+  - `evaluateInVSCode(...)` — run code against the `vscode` API in the extension host
+  - `evaluateHandleInVSCode(...)` — return a _remote handle_ to a VS Code object
+  - `vscode.commands.executeCommand(...)` convenience wrapper
+- ✅ Remote handles support `evaluate(...)`, `evaluateHandle(...)`, `release(...)`
+- ✅ Remote `EventEmitter` handles support `addListener(...)` / `removeListener(...)`
 
-See the example in [examples/custom-editor-sample/tests/draw.spec.ts](https://github.com/ruifigueira/vscode-test-playwright/blob/main/examples/custom-editor-sample/tests/draw.spec.ts).
+## Install
 
-## Core Features
-
-- Unified Test Runner:
-  - Integrates Playwright Test and VSCode extension tests into a single test suite
-  - Easy setup for running and debugging tests.
-- VSCode UI Automation:
-  - Enables direct interaction with VSCode UI elements using Playwright selectors.
-  - Supports common actions like clicking buttons, typing text, and navigating menus.
-- VSCode API Calls:
-  - Allows programmatic interaction with VSCode APIs to simulate user actions or access internal state.
-- Trace Generation:
-  - Captures detailed information about test execution, including screenshots, network requests, and console logs.
-  - Facilitates debugging and troubleshooting.
-
-  [![VS Code Trace](docs/assets/trace.png)](https://trace.playwright.dev/?trace=https://raw.githubusercontent.com/ruifigueira/vscode-test-playwright/main/docs/assets/trace.zip)
-
-- Inspector / Codegen (Experimental)
-  - Visualize and interact with VSCode UI elements in real time, and automatically generate Playwright code snippets for efficient test creation.
-
-## Quick Start
-
-- Install `@playwright/test` and `vscode-test-playwright`
-
-```bash
-npm install --save-dev @playwright/test@latest vscode-test-playwright@latest
+```sh
+npm install
 ```
 
-- edit `playwright.config.ts`:
+This repo builds TypeScript to `dist/` as part of `npm test`.
+
+If you’re consuming this package from another repo, install it as a dependency (published name: `vscode-test-playwright`):
+
+```sh
+npm install --save-dev vscode-test-playwright
+```
+
+## Quick start
+
+### 1) Create `playwright.config.ts`
+
+Type the Playwright config with the provided option types:
 
 ```ts
-import type { VSCodeTestOptions, VSCodeWorkerOptions } from 'vscode-test-playwright';
-import { defineConfig } from '@playwright/test';
-import path from 'path';
+import { defineConfig } from "@playwright/test";
+import type {
+  VSCodeTestOptions,
+  VSCodeWorkerOptions,
+} from "vscode-test-playwright";
+import path from "path";
 
 export default defineConfig<VSCodeTestOptions, VSCodeWorkerOptions>({
-  testDir: path.join(__dirname, 'tests'),
-  fullyParallel: true,
-  forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 2 : 0,
+  testDir: "./tests",
   workers: 1,
-  reporter: 'html',
   use: {
-    // path to your extension folder, where its package.json is located
-    extensionDevelopmentPath: __dirname,
-    vscodeTrace: 'on',
+    // A directory (or .code-workspace) to open in VS Code.
+    baseDir: path.join(__dirname, "tests", "workspaces", "basic"),
+
+    // Optional: for extension development tests.
+    // extensionDevelopmentPath: path.join(__dirname, 'path-to-your-extension'),
+
+    // VS Code version to download via @vscode/test-electron.
+    vscodeVersion: "insiders",
+
+    // Optional: install extensions for this run.
+    // extensions: ['github.copilot', 'github.copilot-chat'],
+
+    // Extra tracing that focuses on VS Code-side calls (separate from Playwright trace).
+    vscodeTrace: "on",
   },
-  projects: [
-    {
-      name: 'insiders',
-      use: { vscodeVersion: 'insiders' },
-    },
-    {
-      name: '1.91.0',
-      use: { vscodeVersion: '1.91.0' },
-    },
-  ],
 });
 ```
 
-- create a test file `tests/basic.spec.ts`:
+### 2) Write a test
 
 ```ts
-import { expect, test } from 'vscode-test-playwright';
+import { test, expect } from "vscode-test-playwright";
 
-test('should show a message', async ({ workbox, evaluateInVSCode }) => {
-  await evaluateInVSCode(vscode => {
-    vscode.window.showInformationMessage('Hello, World!');
-  });
+test("can execute a VS Code command", async ({ vscode }) => {
+  // Runs inside VS Code extension host.
+  await vscode.commands.executeCommand("workbench.action.showCommands");
 
-  const toast = workbox.locator('.notification-toast', { hasNot: workbox.getByRole('button', { name: 'Install' }) });
-  await expect(toast.locator('.notification-list-item-icon')).toHaveClass(/codicon-info/);
-  await expect(toast.locator('.notification-list-item-message')).toContainText('Hello, World!');
+  expect(true).toBe(true);
+});
+
+test("can evaluate in VS Code", async ({ evaluateInVSCode }) => {
+  const version = await evaluateInVSCode((vscode) => vscode.version);
+  expect(version).toBeTruthy();
 });
 ```
 
-- run it:
+### 3) Run
 
-```bash
-npx playwright test
+```sh
+npm test
 ```
 
-Generated report will include playwright traces from VS Code, which can be very helpful to identify issues of locators for UI elements.
+The default Playwright HTML report is written to `playwright-report/`.
 
-## Using an existing signed-in VS Code profile (Copilot/GitHub)
+## Fixtures
 
-When Playwright launches VS Code it typically uses an isolated `--user-data-dir`.
-That isolation is great for reproducibility, but it also means the spawned VS Code instance will not inherit your normal GitHub/Copilot sign-in state.
+The exported `test` is a Playwright Test instance extended with VS Code-specific fixtures.
 
-This package supports cloning an existing VS Code user data directory into a per-run temporary directory, and then launching with `--user-data-dir` pointing at that clone.
-This avoids VS Code's single-instance handoff while preserving sign-in state.
+### Worker-scoped options (configure via `use:`)
 
-### Relevant environment variables
+- `vscodeVersion: string`
+  - Example values: `'insiders'`, `'stable'`, or a specific version string.
+- `vscodeExecutablePath?: string`
+  - Use an existing VS Code install instead of downloading one.
+  - On macOS you can pass either the `.app` path (it will be normalized) or the Electron binary inside the bundle.
+- `extensions?: string | string[]`
+  - Marketplace extension IDs to install for the test run (e.g. `github.copilot-chat`).
+- `extensionsDir?: string`
+  - Where extensions are installed/loaded from.
+- `userDataDir?: string`
+  - User profile directory for VS Code.
+- `vscodeTrace: 'off' | 'on' | 'retain-on-failure' | ...`
+  - Uses Playwright tracing under the hood but records VS Code calls (evaluate/evaluateHandle) as custom steps.
+
+### Test-scoped options
+
+- `baseDir: string`
+  - The folder (or workspace) to open in VS Code.
+  - If you don’t provide one, a temporary directory is created.
+- `extensionDevelopmentPath?: string`
+  - Optional `--extensionDevelopmentPath=...` passed to VS Code.
+
+### Runtime fixtures
+
+- `electronApp`
+  - Playwright `ElectronApplication` instance for the VS Code process.
+- `workbox` / `page`
+  - The first VS Code window as a Playwright `Page`.
+- `context`
+  - Playwright `BrowserContext`.
+- `vscode`
+  - Convenience wrapper currently exposing:
+    - `vscode.commands.executeCommand(command, ...args)`
+- `evaluateInVSCode(fn, arg?)`
+  - Runs `fn(vscode, arg)` in the VS Code extension host.
+- `evaluateHandleInVSCode(fn, arg?)`
+  - Like `evaluateInVSCode`, but returns a handle that keeps the result alive across calls.
+
+## Handles
+
+`evaluateHandleInVSCode` returns a `VSCodeHandle<T>`.
+
+- For normal objects, you get an `ObjectHandle<T>`:
+  - `handle.evaluate(fn, arg?)`
+  - `handle.evaluateHandle(fn, arg?)`
+  - `handle.release({ dispose?: boolean })`
+
+- If the result is a `vscode.EventEmitter<R>`, you get an `EventEmitterHandle<R>`:
+  - `addListener(listener)`
+  - `removeListener(listener)`
+
+Notes:
+
+- Functions are transmitted by `fn.toString()` and executed in VS Code using `new Function(...)`.
+  - Prefer simple, self-contained functions.
+  - Avoid capturing complex outer-scope variables.
+- Arguments are JSON-serialized, with special support for passing other handles.
+- Always `release()` handles you create (the fixture auto-releases handles returned from `evaluateHandleInVSCode` at the end of the test).
+
+## Environment variables
+
+Useful knobs when running locally or in CI:
 
 - `PW_VSCODE_EXECUTABLE_PATH`
-  - If set, launches that VS Code installation instead of downloading via `@vscode/test-electron`.
-  - macOS examples: `/Applications/Visual Studio Code.app` or `/Applications/Visual Studio Code Insiders.app`.
+  - Alternate way to set `vscodeExecutablePath`.
+- `PW_VSCODE_AUTO_DISCOVER=1`
+  - Best-effort VS Code install auto-discovery (opt-in).
+- `PW_VSCODE_DEBUG=1`
+  - Enables verbose debug logging and mirrors VS Code stdout/stderr.
+- `PW_VSCODE_WAIT_FOR_LINE_TIMEOUT_MS`
+  - Timeout for waiting on VS Code to print the injected server URL.
+- `PW_VSCODE_ISOLATE_EXTENSIONS_DIR`
+  - Defaults to isolating extensions for determinism; set to `0` to opt out.
+- `PW_TEST_DISABLE_TRACING`
+  - Disables tracing capture logic.
 
-- `PW_VSCODE_PROFILE`
-  - Optional VS Code profile name to pass as `--profile <name>`.
-  - Use this when your auth lives in a non-default VS Code Profile.
+## Linux notes
 
-- `PW_VSCODE_CLONE_USER_DATA_FROM`
-  - Path to the source user data directory to clone from.
-  - Special value `default` resolves to the platform-default directory (e.g. `~/Library/Application Support/Code` on macOS stable).
+To run UI/Electron tests on Linux CI you typically need Xvfb and related system deps.
 
-- `PW_VSCODE_CLONE_MODE`
-  - `full` (default): clone the full user data directory (still skips common cache directories).
-  - `minimal`: clone `User/` plus (optionally) a small allowlisted subset of `User/globalStorage`.
+This repo provides:
 
-- `PW_VSCODE_CLONE_INCLUDE_GLOBAL_STORAGE`
-  - In `minimal` mode, set to `0` to skip copying `User/globalStorage` entirely.
-  - Default is `1`.
+- `npm run test:linux` — wrapper script intended for CI environments.
 
-- `PW_VSCODE_CLONE_GLOBAL_STORAGE_ALLOWLIST`
-  - In `minimal` mode, a comma-separated list of extension ids whose `User/globalStorage/<extensionId>` directory should be copied.
-  - Example: `github.copilot,github.copilot-chat`.
+## Development
 
-- `PW_VSCODE_CLONE_EXCLUDE_PATHS`
-  - Comma-separated list of *user-data-relative* paths to exclude from cloning.
-  - Matching is prefix-based: excluding `User/workspaceStorage` skips that directory and everything under it.
-  - Examples:
-    - `User/workspaceStorage`
-    - `User/globalStorage/github.copilot-chat`
-    - `User/storage.json`
+- `npm run build` — compile TypeScript to `dist/`
+- `npm test` — build + run Playwright tests
+- `npm run watch` — TypeScript watch mode
 
-### Iteratively finding the minimal required copy set
+## How it works (high-level)
 
-To determine which pieces of user-data are actually required for a signed-in Copilot run in your environment, run the same test repeatedly while excluding one path at a time via `PW_VSCODE_CLONE_EXCLUDE_PATHS` until the test fails (for example, you see a sign-in prompt).
+1. The Playwright worker fixture downloads or locates a VS Code build.
+2. VS Code is launched via Playwright’s Electron support.
+3. VS Code is started with `--extensionTestsPath=dist/injected/index`, which runs a tiny server in the extension host.
+4. The Playwright side connects over WebSocket JSON-RPC and can:
+   - call functions in the VS Code process (`evaluateInVSCode`)
+   - return and manage remote objects via handles (`evaluateHandleInVSCode`)
+   - subscribe to `EventEmitter` events
 
-## Recording a test
+## Troubleshooting
 
-> [!NOTE]
-> This is an experimental feature.
+- **VS Code exits before tests start**
+  - Set `PW_VSCODE_DEBUG=1` and inspect `vscode-stdout`/`vscode-stderr` attachments under `test-results/`.
+  - Ensure you’re not running with conflicting `VSCODE_*` environment variables.
 
-It's possible to record actions on VS Code using Playwright's `codegen`. To launch it, simply add the `_enableRecorder` fixture to your test:
+- **Extension installation fails**
+  - When using `vscodeExecutablePath`, this harness needs the VS Code CLI location to be resolvable.
+  - Prefer pointing `vscodeExecutablePath` at the actual Electron binary on macOS if you run into CLI resolution issues.
 
-```ts
-test('create file', async ({ page, _enableRecorder }) => {
-});
-```
-
-## API
-
-The following [fixtures](https://playwright.dev/docs/test-fixtures#creating-a-fixture) are available:
-
-### `evaluateInVSCode`
-
-Receives and evaluates a function in the context of VS Code. It has access to `vscode`, as in `import * as vscode from 'vscode';`.
-So, for instance, it's possible to execute a command:
-
-```ts
-test('execute command', async ({ evaluateInVSCode }) => {
-  await evaluateInVSCode(vscode => vscode.commands.executeCommand('vscode.open', Uri.file('/some/path/to/folder')));
-});
-```
-
-It's also possible to pass a [serializable](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON/stringify#description) or handle argument, and return a serializable value, either as a promise or not:
-
-```ts
-test('ensure editor is open', async ({ evaluateInVSCode }) => {
-  const openUris = await evaluateInVSCode(async (vscode, path) => {
-    await vscode.commands.executeCommand('vscode.open', vscode.Uri.parse(path));
-    return vscode.window.visibleTextEditors.map(e => e.document.uri.toString());
-  }, 'untitled:/empty.txt');
-  expect(openUris).toEqual(['untitled:/empty.txt']);
-});
-```
-
-### `evaluateHandleInVSCode`
-
-Similar to `evaluateInVSCode` but can return a reference to a complex VS Code object, so that future interactions can be made with the ssme object.
-
-It's the equivalent of playwright's [evaluateHandle](https://playwright.dev/docs/api/class-page#page-evaluate-handle), but instead of representing object in a browser page, it represents objects in VS Code context.
-
-For instance, here's an example where we get as editor handle and then write text into it:
-
-```ts
-test('write text into new document', async ({ evaluateHandleInVSCode, evaluateInVSCode }) => {
-  const editorHandle = await evaluateHandleInVSCode(async (vscode, path) => {
-  return await vscode.window.showTextDocument(vscode.Uri.parse(path));
-  }, 'untitled:/hello.txt');
-
-  await evaluateInVSCode(async (vscode, editor) => {
-    await editor.edit(edit => edit.insert(new vscode.Position(0, 0), 'Hello, World!'));
-  }, editorHandle);
-
-  const text = await editorHandle.evaluate(editor => editor.document.getText());
-
-  expect(text).toBe(`Hello, World!`);
-});
-```
-
-Notice that we can use `evaluate` function on a handle directly:
-
-```ts
-await editorHandle.evaluate(editor => editor.document.getText())`
-```
-
-All handles obtained with `evaluateHandleInVSCode` are released after each test.
-Nevertheless, it's possible to release an handle explicitly with:
-
-```ts
-await editorHandle.release();
-```
-
-This ensures the reference is released on VS Code side, so that VS Code can eventually clean its resources.
-Future evaluations using a released handle will fail.
-
-For disposable handles, it's also possible to dispose on release:
-
-```ts
-await disposableHandle.release({ dispose: true });
-```
-
-> [!NOTE]
-> Implicit handle release after each test won't dispose its references, so release with dispose must be explicit.
-
-### `EventEmitter` handles
-
-An `EventEmitter` handle allows adding and removing local listeners that are triggered by remote events.
-Events should be [serializable](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON/stringify#description), so it's better to wrap built-in VS Code events before returning them.
-
-An example:
-
-```ts
-test('listen to document changes', async ({ evaluateHandleInVSCode, evaluateInVSCode }) => {
-  const editorHandle = await evaluateHandleInVSCode(async (vscode, path) => {
-  return await vscode.window.showTextDocument(vscode.Uri.parse(path));
-  }, 'untitled:/hello.txt');
-
-  const documentChangedHandle = await evaluateHandleInVSCode(async vscode => {
-    const documentChanged = new vscode.EventEmitter<string>();
-    vscode.workspace.onDidChangeTextDocument(e => documentChanged.fire(e.document.getText()));
-    return documentChanged;
-  });
-
-  const documentChanges: string[] = [];
-  await documentChangedHandle.addListener(change => {
-    documentChanges.push(change);
-  });
-
-  await evaluateInVSCode(async (vscode, editor) => {
-    await editor.edit(edit => edit.insert(new vscode.Position(0, 0), 'Hello, World!'));
-  }, editorHandle);
-
-  await expect.poll(() => documentChanges).toEqual([
-    'Hello, World!',
-  ]);
-});
-
-```
+- **Hangs waiting for server URL**
+  - Increase `PW_VSCODE_WAIT_FOR_LINE_TIMEOUT_MS`.
