@@ -7,7 +7,6 @@
  */
 
 import type { BrowserWindow } from "electron";
-import type { EventEmitter } from "node:events";
 import type {
   ObjectHandle,
   ObjectHandle as ObjectHandleImpl,
@@ -18,10 +17,10 @@ import type {
 } from "./vscodeHandle";
 import * as cp from "node:child_process";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import process from "node:process";
-import * as readline from "node:readline";
 import {
   _electron,
   test as base,
@@ -169,62 +168,21 @@ function toEven(n: number) {
   return n % 2 === 0 ? n : n - 1;
 }
 
-// adapted from https://github.com/microsoft/playwright/blob/a6b320e36224f70ad04fd520503c230d5956ba66/packages/playwright-core/src/server/electron/electron.ts#L294-L320
-function waitForLine(
-  process: cp.ChildProcess,
-  regex: RegExp
-): Promise<RegExpMatchArray> {
-  function addEventListener<Args extends unknown[]>(
-    emitter: EventEmitter,
-    eventName: string | symbol,
-    handler: (...args: Args) => void
-  ) {
-    emitter.on(eventName, handler);
-    return { emitter, eventName, handler };
+async function allocateLocalPort(): Promise<number> {
+  const server = net.createServer();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => resolve());
+    });
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new TypeError("Expected net.Server to have an AddressInfo");
+    }
+    return address.port;
+  } finally {
+    server.close();
   }
-
-  function removeEventListeners(
-    listeners: Array<{
-      emitter: EventEmitter;
-      eventName: string | symbol;
-      handler: (...args: unknown[]) => void;
-    }>
-  ) {
-    for (const listener of listeners) {
-      listener.emitter.removeListener(listener.eventName, listener.handler);
-    }
-    listeners.splice(0, listeners.length);
-  }
-
-  return new Promise((resolve, reject) => {
-    const rl = readline.createInterface({ input: process.stderr! });
-    const failError = new Error("Process failed to launch!");
-    const listeners = [
-      addEventListener(rl, "line", onLine),
-      addEventListener(rl, "close", reject.bind(null, failError)),
-      addEventListener(process, "exit", reject.bind(null, failError)),
-      // It is Ok to remove error handler because we did not create process and there is another listener.
-      addEventListener(process, "error", reject.bind(null, failError)),
-    ];
-
-    function onLine(...args: unknown[]) {
-      const line = args[0];
-      if (typeof line !== "string") {
-        return;
-      }
-
-      const match = line.match(regex);
-      if (!match) {
-        return;
-      }
-      cleanup();
-      resolve(match);
-    }
-
-    function cleanup() {
-      removeEventListeners(listeners);
-    }
-  });
 }
 
 export const test = base.extend<
@@ -289,7 +247,7 @@ export const test = base.extend<
             }
           );
           subProcess.on("exit", (code, signal) => {
-            if (!code) {
+            if (code === 0) {
               resolve();
             } else {
               reject(
@@ -339,11 +297,14 @@ export const test = base.extend<
       const injectedEntryPath = path.join(
         process.cwd(),
         "out",
-        "vendor",
         "vscode-test-playwright",
         "injected",
         "index.js"
       );
+
+      const wsPort = await allocateLocalPort();
+      env.PW_VSCODE_TEST_WS_PORT = String(wsPort);
+      process.env.PW_VSCODE_TEST_WS_PORT = String(wsPort);
 
       const videoOptions = normalizeVideoOptions(vscodeVideo);
       const shouldRecordVideo = videoOptions.mode !== "off";
@@ -360,6 +321,25 @@ export const test = base.extend<
             height: toEven(requestedVideoSize.height),
           }
         : undefined;
+
+      const resolvedExtensionsDir = extensionsDir ?? path.join(cachePath, "extensions");
+      const resolvedUserDataDir = userDataDir ?? path.join(cachePath, "user-data");
+
+      // Prevent VS Code's Git extension from blocking tests with the
+      // "open repository in parent folders" notification.
+      const settingsPath = path.join(resolvedUserDataDir, "User", "settings.json");
+      await fs.promises.mkdir(path.dirname(settingsPath), { recursive: true });
+      await fs.promises.writeFile(
+        settingsPath,
+        `${JSON.stringify(
+          {
+            "git.openRepositoryInParentFolders": "never",
+          },
+          null,
+          2
+        )}\n`,
+        "utf8"
+      );
 
       const electronApp = await _electron.launch({
         executablePath: installPath,
@@ -391,10 +371,8 @@ export const test = base.extend<
                 "--force-device-scale-factor=1",
               ]
             : []),
-          `--extensions-dir=${
-            extensionsDir ?? path.join(cachePath, "extensions")
-          }`,
-          `--user-data-dir=${userDataDir ?? path.join(cachePath, "user-data")}`,
+          `--extensions-dir=${resolvedExtensionsDir}`,
+          `--user-data-dir=${resolvedUserDataDir}`,
           `--extensionTestsPath=${injectedEntryPath}`,
           ...(extensionDevelopmentPath
             ? [`--extensionDevelopmentPath=${extensionDevelopmentPath}`]
@@ -519,10 +497,16 @@ export const test = base.extend<
     // Playwright no longer exposes `playwright._toImpl` in newer versions.
     // Use the ChannelOwner connection helper instead.
     void playwright;
-    const toImplUnknown = (electronApp as unknown as { _connection?: { toImpl?: unknown } })
-      ._connection?.toImpl;
+    const connection = (electronApp as unknown as { _connection?: unknown })
+      ._connection;
+    if (!connection || typeof connection !== "object") {
+      throw new TypeError(
+        "Expected electronApp._connection to be an object (Playwright internal API changed)."
+      );
+    }
+    const toImplUnknown = (connection as { toImpl?: unknown }).toImpl;
     if (typeof toImplUnknown !== "function") {
-      throw new Error(
+      throw new TypeError(
         "Expected electronApp._connection.toImpl to be a function (Playwright internal API changed)."
       );
     }
@@ -530,22 +514,64 @@ export const test = base.extend<
 
     const electronAppImpl =
       (await Promise.resolve(toImpl(electronApp))) as ElectronAppImplLike;
-    // check recent logs or wait for URL to access VSCode test server
-    const vscodeTestServerRegExp =
-      /^VSCodeTestServer listening on (http:\/\/.*)$/;
-    const process = electronAppImpl._process as cp.ChildProcess;
-    const recentLogs =
-      electronAppImpl._nodeConnection._browserLogsCollector.recentLogs() as string[];
-    const matches = recentLogs
-      .map((s) => s.match(vscodeTestServerRegExp))
-      .filter((m): m is RegExpMatchArray => m !== null);
-    let match = matches[0];
-    if (!match) {
-      match = await waitForLine(process, vscodeTestServerRegExp);
+    const wsPortRaw = process.env.PW_VSCODE_TEST_WS_PORT;
+    if (!wsPortRaw) {
+      throw new Error("Missing required env var: PW_VSCODE_TEST_WS_PORT");
+    }
+    const wsPort = Number.parseInt(wsPortRaw, 10);
+    if (!Number.isFinite(wsPort) || wsPort <= 0) {
+      throw new TypeError(`Invalid PW_VSCODE_TEST_WS_PORT: ${wsPortRaw}`);
     }
 
-    const ws = new WebSocket(match[1]);
-    await new Promise((r) => ws.once("open", r));
+    const readyNeedle = `VSCodeTestServer listening on http://localhost:${wsPort}`;
+    const logDeadline = Date.now() + 5_000;
+    let sawReadyLog = false;
+    while (!sawReadyLog && Date.now() < logDeadline) {
+      const recentLogs = electronAppImpl._nodeConnection._browserLogsCollector
+        .recentLogs();
+      sawReadyLog = recentLogs.some((s) => s.includes(readyNeedle));
+      if (!sawReadyLog) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
+    if (!sawReadyLog) {
+      const recentLogs = electronAppImpl._nodeConnection._browserLogsCollector
+        .recentLogs();
+      throw new Error(
+        `VSCodeTestServer never reported readiness for port ${wsPort}. Recent logs:\n${recentLogs.slice(-80).join("\n")}`
+      );
+    }
+
+    const wsUrl = `ws://127.0.0.1:${wsPort}`;
+    const ws = await (async () => {
+      const deadline = Date.now() + 5_000;
+      let lastError: unknown;
+      while (Date.now() < deadline) {
+        const attempt = new WebSocket(wsUrl);
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const timeout = setTimeout(() => {
+              reject(new Error(`Timed out waiting for WebSocket open: ${wsUrl}`));
+            }, 500);
+
+            attempt.once("open", () => {
+              clearTimeout(timeout);
+              resolve();
+            });
+            attempt.once("error", (err) => {
+              clearTimeout(timeout);
+              reject(err);
+            });
+          });
+          return attempt;
+        } catch (err: unknown) {
+          lastError = err;
+          attempt.close();
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+      throw lastError ?? new Error(`Failed to connect WebSocket: ${wsUrl}`);
+    })();
     // Our current Playwright build no longer exposes the private tracing hooks
     // expected by the vendored evaluator (Tracing.onBeforeCall/onAfterCall).
     // Disable this integration; VS Code traces are still collected separately.
@@ -605,6 +631,9 @@ export const test = base.extend<
   },
 
   _createTempDir: [
+    // Playwright fixture functions must use object destructuring for their first argument.
+    // This fixture intentionally has no dependencies.
+    // eslint-disable-next-line no-empty-pattern
     async ({}, use) => {
       const tempDirs: string[] = [];
       await use(async () => {

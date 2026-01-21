@@ -30,6 +30,7 @@
   },
   "dependencies": {
     "@vscode/test-electron": "^2.5.2",
+    "vscode-jsonrpc": "^8.2.1",
     "ws": "^8.19.0"
   }
 }

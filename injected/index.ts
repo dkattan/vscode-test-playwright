@@ -1,7 +1,3 @@
-/*
- * Vendored from https://github.com/ruifigueira/vscode-test-playwright (Apache-2.0).
- * Source snapshot: tmp/vscode-test-playwright @ 6c9d976 (in this repo's dev workspace).
- */
 
 import type { AddressInfo } from "node:net";
 import type { RawData, WebSocket } from "ws";

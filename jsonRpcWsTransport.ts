@@ -5,6 +5,7 @@
  */
 
 import type { EventEmitter } from "node:events";
+import { Buffer } from "node:buffer";
 import {
   type DataCallback,
   type Disposable,
@@ -19,6 +20,31 @@ import {
 export interface WsLike extends EventEmitter {
   send: (data: string) => void;
   close: () => void;
+}
+
+function rawToUtf8String(raw: unknown): string {
+  if (typeof raw === "string") {
+    return raw;
+  }
+
+  if (Buffer.isBuffer(raw)) {
+    return raw.toString("utf8");
+  }
+
+  if (raw instanceof ArrayBuffer) {
+    return Buffer.from(raw).toString("utf8");
+  }
+
+  // ws may pass a TypedArray view.
+  if (ArrayBuffer.isView(raw)) {
+    return Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength).toString(
+      "utf8"
+    );
+  }
+
+  throw new TypeError(
+    `Expected WebSocket message payload to be string/buffer, got ${Object.prototype.toString.call(raw)}`
+  );
 }
 
 function asError(e: unknown): Error {
@@ -50,13 +76,7 @@ export class WebSocketMessageReader implements MessageReader {
     this.cb = callback;
 
     const onMessage = (raw: unknown) => {
-      if (typeof raw !== "string") {
-        throw new TypeError(
-          `Expected WebSocket message payload to be a string, got ${typeof raw}`
-        );
-      }
-
-      const parsed = JSON.parse(raw) as unknown;
+      const parsed = JSON.parse(rawToUtf8String(raw)) as unknown;
       // vscode-jsonrpc expects JSON-RPC message objects.
       this.cb?.(parsed as Message);
     };
