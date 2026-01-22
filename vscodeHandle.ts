@@ -5,16 +5,14 @@
 
 import type * as vscode from "vscode";
 import type { Disposable, EventEmitter } from "vscode";
-import type { WebSocket } from "ws";
 import {
-  createMessageConnection,
   type MessageConnection,
 } from "vscode-jsonrpc";
 import {
-  WebSocketMessageReader,
-  WebSocketMessageWriter,
-  type WsLike,
-} from "./jsonRpcWsTransport";
+  closeRpcTransport,
+  createRpcConnection,
+  type RpcTransport,
+} from "./rpcTransport";
 import {
   type DispatchEventParams,
   type InvokeMethodParams,
@@ -53,19 +51,17 @@ export type VSCodeHandle<T> = T extends EventEmitter<infer R>
   : ObjectHandle<T>;
 
 export class VSCodeEvaluator {
-  private readonly _ws: WebSocket;
+  private readonly _transport: RpcTransport;
   private readonly _connection: MessageConnection;
   private _cache = new Map<number, ObjectHandle<unknown>>();
   private _listeners = new Map<number, Set<(event: unknown) => unknown>>();
   private _page: unknown;
 
-  constructor(ws: WebSocket, pageImpl: unknown) {
-    this._ws = ws;
+  constructor(transport: RpcTransport, pageImpl: unknown) {
+    this._transport = transport;
     this._page = pageImpl;
 
-    const reader = new WebSocketMessageReader(ws as unknown as WsLike);
-    const writer = new WebSocketMessageWriter(ws as unknown as WsLike);
-    this._connection = createMessageConnection(reader, writer);
+    this._connection = createRpcConnection(transport);
 
     this._connection.onNotification(
       RPC.dispatchEvent,
@@ -222,7 +218,7 @@ export class VSCodeEvaluator {
       [...this._cache.keys()].map((objectId) => this.release(objectId))
     ).catch(() => {});
     this._connection.dispose();
-    this._ws.removeAllListeners("message");
+    closeRpcTransport(this._transport);
   }
 
   private async _sendAndWait(

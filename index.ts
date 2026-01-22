@@ -15,7 +15,9 @@ import type {
   VSCodeHandle,
 } from "./vscodeHandle";
 import * as cp from "node:child_process";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
@@ -32,6 +34,7 @@ import {
 } from "@vscode/test-electron";
 import { WebSocket, WebSocketServer } from "ws";
 import { VSCodeEvaluator as VSCodeEvaluatorImpl } from "./vscodeHandle";
+import { closeRpcTransport, type RpcTransport } from "./rpcTransport";
 
 // NOTE: Export `expect` from this module for convenience. We bind it to the
 // current test instance (test.expect) later.
@@ -101,10 +104,17 @@ interface ExperimentalVSCodeTestFixtures {
 interface InternalWorkerFixtures {
   _createTempDir: () => Promise<string>;
   _vscodeInstall: { installPath: string; cachePath: string };
-  _rpcServer: {
-    url: string;
-    waitForConnection: () => Promise<WebSocket>;
-  };
+  _rpcServer:
+    | {
+        transport: "ws";
+        url: string;
+        waitForConnection: () => Promise<RpcTransport>;
+      }
+    | {
+        transport: "pipe";
+        pipePath: string;
+        waitForConnection: () => Promise<RpcTransport>;
+      };
 }
 
 interface InternalTestFixtures {
@@ -176,6 +186,58 @@ function toEven(n: number) {
   return n % 2 === 0 ? n : n - 1;
 }
 
+async function waitForWebmVideoToFinalize(options: {
+  videoDir: string;
+  timeoutMs: number;
+  pollIntervalMs?: number;
+}): Promise<string | undefined> {
+  const pollIntervalMs = options.pollIntervalMs ?? 500;
+  const deadline = Date.now() + options.timeoutMs;
+
+  let candidate: string | undefined;
+  let lastSize = -1;
+  let stableCount = 0;
+
+  while (Date.now() < deadline) {
+    let entries: string[] = [];
+    try {
+      entries = await fs.promises.readdir(options.videoDir);
+    } catch {
+      // If the directory isn't readable yet, keep waiting.
+    }
+
+    const webms = entries
+      .filter((e) => e.toLowerCase().endsWith(".webm"))
+      .map((e) => path.join(options.videoDir, e));
+
+    if (webms.length > 0) {
+      candidate = webms[0];
+      try {
+        const st = await fs.promises.stat(candidate);
+        if (st.size > 0) {
+          if (st.size === lastSize) {
+            stableCount += 1;
+          } else {
+            stableCount = 0;
+          }
+          lastSize = st.size;
+
+          // Require a couple stable samples to reduce the chance we race an in-progress write.
+          if (stableCount >= 2) {
+            return candidate;
+          }
+        }
+      } catch {
+        // Ignore transient stat failures.
+      }
+    }
+
+    await new Promise((r) => setTimeout(r, pollIntervalMs));
+  }
+
+  return candidate;
+}
+
 export const test = base.extend<
   VSCodeTestFixtures &
     VSCodeTestOptions &
@@ -197,12 +259,120 @@ export const test = base.extend<
 
   _rpcServer: [
     async ({}, use) => {
-      const sockets = new Set<WebSocket>();
-      const pending: WebSocket[] = [];
-      const waiters: Array<(socket: WebSocket) => void> = [];
-      const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+      const wsConnectTimeoutMs = (() => {
+        const raw = process.env.PW_VSCODE_TEST_WS_CONNECT_TIMEOUT_MS;
+        if (raw === undefined) {
+          return 30_000;
+        }
 
-      wss.on("connection", (socket) => {
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n <= 0) {
+          throw new Error(
+            `PW_VSCODE_TEST_WS_CONNECT_TIMEOUT_MS must be a positive number of milliseconds; got '${raw}'.`
+          );
+        }
+
+        return n;
+      })();
+
+      const transport = (process.env.PW_VSCODE_TEST_TRANSPORT ?? "ws").trim();
+      if (transport !== "ws" && transport !== "pipe") {
+        throw new Error(
+          `PW_VSCODE_TEST_TRANSPORT must be 'ws' or 'pipe'; got '${transport}'.`
+        );
+      }
+
+      if (transport === "ws") {
+        const sockets = new Set<WebSocket>();
+        const pending: WebSocket[] = [];
+        const waiters: Array<(socket: WebSocket) => void> = [];
+        const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+
+        wss.on("connection", (socket) => {
+          sockets.add(socket);
+          socket.on("close", () => sockets.delete(socket));
+
+          const waiter = waiters.shift();
+          if (waiter) {
+            waiter(socket);
+          } else {
+            pending.push(socket);
+          }
+        });
+
+        await new Promise<void>((resolve, reject) => {
+          wss.once("listening", () => resolve());
+          wss.once("error", (err) => reject(err));
+        });
+
+        const address = wss.address();
+        if (!address || typeof address === "string") {
+          throw new Error(
+            "WebSocketServer did not expose a TCP address. This harness requires host+port."
+          );
+        }
+
+        const url = `ws://127.0.0.1:${address.port}`;
+
+        const waitForConnection = async (): Promise<RpcTransport> => {
+          const existing = pending.shift();
+          if (existing) {
+            return { kind: "ws", socket: existing };
+          }
+
+          return await new Promise<RpcTransport>((resolve, reject) => {
+            let onSocket: ((socket: WebSocket) => void) | undefined;
+            const timeout = setTimeout(() => {
+              if (onSocket) {
+                const idx = waiters.indexOf(onSocket);
+                if (idx >= 0) {
+                  waiters.splice(idx, 1);
+                }
+              }
+              reject(
+                new Error(
+                  `Timed out after ${wsConnectTimeoutMs}ms waiting for extension host connection (transport=ws, env=PW_VSCODE_TEST_WS_URL).`
+                )
+              );
+            }, wsConnectTimeoutMs);
+
+            onSocket = (socket: WebSocket) => {
+              clearTimeout(timeout);
+              resolve({ kind: "ws", socket });
+
+              const idx = pending.indexOf(socket);
+              if (idx >= 0) {
+                pending.splice(idx, 1);
+              }
+            };
+
+            waiters.push(onSocket);
+            timeout.unref?.();
+          });
+        };
+
+        try {
+          await use({ transport: "ws", url, waitForConnection });
+        } finally {
+          for (const socket of sockets) {
+            try {
+              socket.close();
+            } catch {
+              // ignore
+            }
+          }
+
+          await new Promise<void>((resolve) => wss.close(() => resolve()));
+        }
+
+        return;
+      }
+
+      // transport === 'pipe'
+      const sockets = new Set<net.Socket>();
+      const pending: net.Socket[] = [];
+      const waiters: Array<(socket: net.Socket) => void> = [];
+      const server = net.createServer((socket) => {
         sockets.add(socket);
         socket.on("close", () => sockets.delete(socket));
 
@@ -214,28 +384,38 @@ export const test = base.extend<
         }
       });
 
-      await new Promise<void>((resolve, reject) => {
-        wss.once("listening", () => resolve());
-        wss.once("error", (err) => reject(err));
-      });
+      const pipePath = (() => {
+        if (process.platform === "win32") {
+          return `\\\\.\\pipe\\pw-vscode-test-${crypto.randomUUID()}`;
+        }
+        // Keep the filename short to avoid Unix domain socket path length limits.
+        const name = `pw-vscode-${crypto.randomBytes(6).toString("hex")}.sock`;
+        return path.join(os.tmpdir(), name);
+      })();
 
-      const address = wss.address();
-      if (!address || typeof address === "string") {
-        throw new Error(
-          "WebSocketServer did not expose a TCP address. This harness requires host+port."
-        );
+      if (process.platform !== "win32") {
+        // Best-effort cleanup if a previous run left the socket file behind.
+        try {
+          fs.rmSync(pipePath, { force: true });
+        } catch {
+          // ignore
+        }
       }
 
-      const url = `ws://127.0.0.1:${address.port}`;
+      await new Promise<void>((resolve, reject) => {
+        server.once("listening", () => resolve());
+        server.once("error", (err) => reject(err));
+        server.listen(pipePath);
+      });
 
-      const waitForConnection = async (): Promise<WebSocket> => {
+      const waitForConnection = async (): Promise<RpcTransport> => {
         const existing = pending.shift();
         if (existing) {
-          return existing;
+          return { kind: "pipe", socket: existing };
         }
 
-        return await new Promise<WebSocket>((resolve, reject) => {
-          let onSocket: ((socket: WebSocket) => void) | undefined;
+        return await new Promise<RpcTransport>((resolve, reject) => {
+          let onSocket: ((socket: net.Socket) => void) | undefined;
           const timeout = setTimeout(() => {
             if (onSocket) {
               const idx = waiters.indexOf(onSocket);
@@ -245,16 +425,15 @@ export const test = base.extend<
             }
             reject(
               new Error(
-                  "Timed out waiting for extension host WebSocket connection (PW_VSCODE_TEST_WS_URL)."
+                `Timed out after ${wsConnectTimeoutMs}ms waiting for extension host connection (transport=pipe, env=PW_VSCODE_TEST_PIPE_PATH).`
               )
             );
-          }, 30_000);
+          }, wsConnectTimeoutMs);
 
-          onSocket = (socket: WebSocket) => {
+          onSocket = (socket: net.Socket) => {
             clearTimeout(timeout);
-            resolve(socket);
+            resolve({ kind: "pipe", socket });
 
-            // If this socket was already enqueued, remove it from pending.
             const idx = pending.indexOf(socket);
             if (idx >= 0) {
               pending.splice(idx, 1);
@@ -262,24 +441,30 @@ export const test = base.extend<
           };
 
           waiters.push(onSocket);
-
-          // Ensure we don't leak a waiter on timeout.
           timeout.unref?.();
         });
       };
 
       try {
-        await use({ url, waitForConnection });
+        await use({ transport: "pipe", pipePath, waitForConnection });
       } finally {
         for (const socket of sockets) {
           try {
-            socket.close();
+            socket.destroy();
           } catch {
             // ignore
           }
         }
 
-        await new Promise<void>((resolve) => wss.close(() => resolve()));
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+
+        if (process.platform !== "win32") {
+          try {
+            fs.rmSync(pipePath, { force: true });
+          } catch {
+            // ignore
+          }
+        }
       }
     },
     { timeout: 0, scope: "worker" },
@@ -374,8 +559,13 @@ export const test = base.extend<
         }
       }
 
-      // The extension host VSCodeTestServer connects back to this URL.
-      env.PW_VSCODE_TEST_WS_URL = _rpcServer.url;
+      // The extension host VSCodeTestServer connects back to us using the selected transport.
+      env.PW_VSCODE_TEST_TRANSPORT = _rpcServer.transport;
+      if (_rpcServer.transport === "ws") {
+        env.PW_VSCODE_TEST_WS_URL = _rpcServer.url;
+      } else {
+        env.PW_VSCODE_TEST_PIPE_PATH = _rpcServer.pipePath;
+      }
 
       // NOTE: VS Code's --extensionTestsPath must point at a JS file. We rely on `npm run compile-tests`
       // to produce `dist/` before running Playwright.
@@ -390,6 +580,15 @@ export const test = base.extend<
       const videoDir = testInfo.outputPath("videos");
       if (shouldRecordVideo) {
         await fs.promises.mkdir(videoDir, { recursive: true });
+      }
+
+      if (process.env.PW_VSCODE_DEBUG) {
+        // eslint-disable-next-line no-console
+        console.log(
+          `PW_VSCODE_DEBUG: vscodeVideo raw=${JSON.stringify(
+            vscodeVideo
+          )} normalized=${JSON.stringify(videoOptions)} shouldRecordVideo=${shouldRecordVideo} videoDir=${videoDir}`
+        );
       }
 
       const requestedWindowSize = videoOptions.windowSize;
@@ -534,6 +733,44 @@ export const test = base.extend<
 
       await electronApp.close();
 
+      // recordVideo requires the context to close to finalize .webm output.
+      // On some hosts (notably containerized runs), the .webm can appear slightly after close.
+      if (shouldRecordVideo) {
+        const timeoutMsRaw = process.env.PW_VSCODE_VIDEO_FINALIZE_TIMEOUT_MS;
+        const timeoutMs = timeoutMsRaw ? Number(timeoutMsRaw) : 30_000;
+        if (!Number.isNaN(timeoutMs) && timeoutMs > 0) {
+          const finalized = await waitForWebmVideoToFinalize({
+            videoDir,
+            timeoutMs,
+          });
+          if (process.env.PW_VSCODE_DEBUG) {
+            // eslint-disable-next-line no-console
+            console.log(
+              finalized
+                ? `PW_VSCODE_DEBUG: recordVideo finalized: ${finalized}`
+                : `PW_VSCODE_DEBUG: recordVideo did not finalize within ${timeoutMs}ms (dir: ${videoDir})`
+            );
+
+            try {
+              const entries = await fs.promises.readdir(videoDir);
+              // eslint-disable-next-line no-console
+              console.log(
+                `PW_VSCODE_DEBUG: videoDir entries (${videoDir}): ${entries.join(
+                  ", "
+                )}`
+              );
+            } catch (err) {
+              // eslint-disable-next-line no-console
+              console.log(
+                `PW_VSCODE_DEBUG: unable to read videoDir (${videoDir}): ${String(
+                  err
+                )}`
+              );
+            }
+          }
+        }
+      }
+
       // If requested, delete videos from successful runs.
       if (shouldRecordVideo && videoOptions.mode === "retain-on-failure") {
         const testFailed = testInfo.status !== testInfo.expectedStatus;
@@ -568,22 +805,18 @@ export const test = base.extend<
     void vscodeTrace;
     void testInfo;
 
-    // The extension host entrypoint connects back to our worker-scoped WebSocket server.
+    // The extension host entrypoint connects back to our worker-scoped RPC server.
     // Multiple connections are fine; for each test we use the next connection.
     void electronApp;
-    const ws = await _rpcServer.waitForConnection();
+    const transport = await _rpcServer.waitForConnection();
     // Our current Playwright build no longer exposes the private tracing hooks
     // expected by the vendored evaluator (Tracing.onBeforeCall/onAfterCall).
     // Disable this integration; VS Code traces are still collected separately.
     const pageImpl = undefined;
-    const evaluator = new VSCodeEvaluatorImpl(ws, pageImpl);
+    const evaluator = new VSCodeEvaluatorImpl(transport, pageImpl);
     await use(evaluator);
 
-    try {
-      ws.close();
-    } catch {
-      // ignore
-    }
+    closeRpcTransport(transport);
   },
 
   _vscodeHandle: async ({ _evaluator }, use) => {

@@ -1,14 +1,13 @@
-import type { RawData, WebSocket } from "ws";
 import * as vscode from "vscode";
 import {
-  createMessageConnection,
   type MessageConnection,
 } from "vscode-jsonrpc";
 import {
-  WebSocketMessageReader,
-  WebSocketMessageWriter,
-  type WsLike,
-} from "../jsonRpcWsTransport";
+  createRpcConnection,
+  closeRpcTransport,
+  waitForRpcTransportClose,
+  type RpcTransport,
+} from "../rpcTransport";
 import {
   type DispatchEventParams,
   type InvokeMethodParams,
@@ -19,7 +18,7 @@ import {
 } from "../rpcTypes";
 
 export class VSCodeTestServer {
-  private readonly ws: WebSocket;
+  private readonly transport: RpcTransport;
   private readonly connection: MessageConnection;
   private _lastObjectId = 0;
   private _objectsById = new Map<number, unknown>([[0, vscode]]);
@@ -31,11 +30,9 @@ export class VSCodeTestServer {
     vscode.Disposable & { listenerCount: number }
   >();
 
-  constructor(ws: WebSocket) {
-    this.ws = ws;
-    const reader = new WebSocketMessageReader(ws as unknown as WsLike);
-    const writer = new WebSocketMessageWriter(ws as unknown as WsLike);
-    this.connection = createMessageConnection(reader, writer);
+  constructor(transport: RpcTransport) {
+    this.transport = transport;
+    this.connection = createRpcConnection(transport);
 
     this.connection.onRequest(RPC.release, (p: ReleaseParams) => {
       this._release(p);
@@ -58,25 +55,19 @@ export class VSCodeTestServer {
 
   async run() {
     // Begin listening immediately. The Node harness may send requests as soon as
-    // the TCP handshake completes.
+    // the transport connection is established.
     this.connection.listen();
 
     await Promise.all([
       // returning from run() will kill vscode before electron.close(), so we need to hang it until process exit
       new Promise((resolve) => process.on("exit", resolve)),
-      new Promise<void>((resolve, reject) => {
-        this.ws.on("message", (_data: RawData) => {
-          // Handled by WebSocketMessageReader via vscode-jsonrpc.
-        });
-        this.ws.on("error", reject);
-        this.ws.on("close", resolve);
-      }).finally(() => this.dispose()),
+      waitForRpcTransportClose(this.transport).finally(() => this.dispose()),
     ]);
   }
 
   dispose() {
     this.connection.dispose();
-    this.ws.close();
+    closeRpcTransport(this.transport);
     const emitters = this._eventEmitters.values();
     this._eventEmitters.clear();
     for (const emitter of emitters) {
