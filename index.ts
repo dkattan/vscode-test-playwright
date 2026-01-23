@@ -745,6 +745,43 @@ export const test = base.extend<
         "utf8"
       );
 
+      const electronArgs = [
+        // Stolen from https://github.com/microsoft/vscode-test/blob/0ec222ef170e102244569064a12898fb203e5bb7/lib/runTest.ts#L126-L160
+        // https://github.com/microsoft/vscode/issues/84238
+        "--no-sandbox",
+        // https://github.com/microsoft/vscode-test/issues/221
+        "--disable-gpu-sandbox",
+        // https://github.com/microsoft/vscode-test/issues/120
+        "--disable-updates",
+        "--skip-welcome",
+        "--skip-release-notes",
+        "--disable-workspace-trust",
+        ...(requestedWindowSize
+          ? [
+              // Best-effort hint; VS Code/Electron may ignore this.
+              `--window-size=${requestedWindowSize.width},${requestedWindowSize.height}`,
+              // Avoid retina scaling making the pixel dimensions diverge.
+              "--force-device-scale-factor=1",
+            ]
+          : []),
+        `--extensions-dir=${resolvedExtensionsDir}`,
+        `--user-data-dir=${resolvedUserDataDir}`,
+        `--extensionTestsPath=${testServerEntryPath}`,
+        ...(extensionDevelopmentPath
+          ? [`--extensionDevelopmentPath=${extensionDevelopmentPath}`]
+          : []),
+        baseDir,
+      ];
+
+      if (process.env.PW_VSCODE_DEBUG) {
+        // eslint-disable-next-line no-console
+        console.log(
+          `PW_VSCODE_DEBUG: launching VS Code with argv:\n${electronArgs
+            .map((a) => `  ${a}`)
+            .join("\n")}`
+        );
+      }
+
       const electronApp = await _electron.launch({
         executablePath: installPath,
         env,
@@ -756,33 +793,7 @@ export const test = base.extend<
               },
             }
           : {}),
-        args: [
-          // Stolen from https://github.com/microsoft/vscode-test/blob/0ec222ef170e102244569064a12898fb203e5bb7/lib/runTest.ts#L126-L160
-          // https://github.com/microsoft/vscode/issues/84238
-          "--no-sandbox",
-          // https://github.com/microsoft/vscode-test/issues/221
-          "--disable-gpu-sandbox",
-          // https://github.com/microsoft/vscode-test/issues/120
-          "--disable-updates",
-          "--skip-welcome",
-          "--skip-release-notes",
-          "--disable-workspace-trust",
-          ...(requestedWindowSize
-            ? [
-                // Best-effort hint; VS Code/Electron may ignore this.
-                `--window-size=${requestedWindowSize.width},${requestedWindowSize.height}`,
-                // Avoid retina scaling making the pixel dimensions diverge.
-                "--force-device-scale-factor=1",
-              ]
-            : []),
-          `--extensions-dir=${resolvedExtensionsDir}`,
-          `--user-data-dir=${resolvedUserDataDir}`,
-          `--extensionTestsPath=${testServerEntryPath}`,
-          ...(extensionDevelopmentPath
-            ? [`--extensionDevelopmentPath=${extensionDevelopmentPath}`]
-            : []),
-          baseDir,
-        ],
+        args: electronArgs,
       });
 
       if (isHarnessTraceEnabled()) {

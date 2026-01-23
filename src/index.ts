@@ -767,6 +767,37 @@ export const test = base.extend<
         );
       }
 
+      const electronArgs = [
+        ...platformArgs,
+        // Stolen from https://github.com/microsoft/vscode-test/blob/0ec222ef170e102244569064a12898fb203e5bb7/lib/runTest.ts#L126-L160
+        // https://github.com/microsoft/vscode/issues/84238
+        "--no-sandbox",
+        // https://github.com/microsoft/vscode-test/issues/221
+        "--disable-gpu-sandbox",
+        // https://github.com/microsoft/vscode-test/issues/120
+        "--disable-updates",
+        "--skip-welcome",
+        "--skip-release-notes",
+        "--disable-workspace-trust",
+        // Only pin dirs when the caller explicitly asked for them OR when we
+        // installed extensions into a temp dir for this run.
+        ...(extensions || effectiveExtensionsDir
+          ? [`--extensions-dir=${effectiveExtensionsDir ?? path.join(cachePath, "extensions")}`]
+          : []),
+        ...(effectiveUserDataDir ? [`--user-data-dir=${effectiveUserDataDir}`] : []),
+        `--extensionTestsPath=${path.join(__dirname, "injected", "index")}`,
+        ...(extensionDevelopmentPath
+          ? [`--extensionDevelopmentPath=${extensionDevelopmentPath}`]
+          : []),
+        baseDir,
+      ];
+
+      debugLog(
+        `electron argv:\n${electronArgs
+          .map((a) => `  ${a}`)
+          .join("\n")}`
+      );
+
       const electronApp = await _electron.launch({
         executablePath: electronExecutablePath,
         env,
@@ -778,32 +809,7 @@ export const test = base.extend<
             },
           }
           : {}),
-        args: [
-          ...platformArgs,
-          // Stolen from https://github.com/microsoft/vscode-test/blob/0ec222ef170e102244569064a12898fb203e5bb7/lib/runTest.ts#L126-L160
-          // https://github.com/microsoft/vscode/issues/84238
-          "--no-sandbox",
-          // https://github.com/microsoft/vscode-test/issues/221
-          "--disable-gpu-sandbox",
-          // https://github.com/microsoft/vscode-test/issues/120
-          "--disable-updates",
-          "--skip-welcome",
-          "--skip-release-notes",
-          "--disable-workspace-trust",
-          // Only pin dirs when the caller explicitly asked for them OR when we
-          // installed extensions into a temp dir for this run.
-          ...(extensions || effectiveExtensionsDir
-            ? [`--extensions-dir=${effectiveExtensionsDir ?? path.join(cachePath, "extensions")}`]
-            : []),
-          ...(effectiveUserDataDir
-            ? [`--user-data-dir=${effectiveUserDataDir}`]
-            : []),
-          `--extensionTestsPath=${path.join(__dirname, "injected", "index")}`,
-          ...(extensionDevelopmentPath
-            ? [`--extensionDevelopmentPath=${extensionDevelopmentPath}`]
-            : []),
-          baseDir,
-        ],
+        args: electronArgs,
       });
 
       debugLog(`_electron.launch() returned; waiting for firstWindow()`);
