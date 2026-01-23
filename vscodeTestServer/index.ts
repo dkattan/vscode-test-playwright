@@ -6,7 +6,7 @@ import type { RpcTransport } from "../rpcTransport";
 // Entry point passed to VS Code via --extensionTestsPath.
 // This runs inside the VS Code extension host process.
 export async function run() {
-  const transport = (process.env.PW_VSCODE_TEST_TRANSPORT ?? "ws").trim();
+  const transport = (process.env.PW_VSCODE_TEST_TRANSPORT ?? "pipe").trim();
   if (transport !== "ws" && transport !== "pipe") {
     throw new Error(
       `PW_VSCODE_TEST_TRANSPORT must be 'ws' or 'pipe'; got '${transport}'.`

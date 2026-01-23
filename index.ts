@@ -275,7 +275,7 @@ export const test = base.extend<
         return n;
       })();
 
-      const transport = (process.env.PW_VSCODE_TEST_TRANSPORT ?? "ws").trim();
+      const transport = (process.env.PW_VSCODE_TEST_TRANSPORT ?? "pipe").trim();
       if (transport !== "ws" && transport !== "pipe") {
         throw new Error(
           `PW_VSCODE_TEST_TRANSPORT must be 'ws' or 'pipe'; got '${transport}'.`
