@@ -36,6 +36,62 @@ import { WebSocket, WebSocketServer } from "ws";
 import { VSCodeEvaluator as VSCodeEvaluatorImpl } from "./vscodeHandle";
 import { closeRpcTransport, type RpcTransport } from "./rpcTransport";
 
+function isHarnessTraceEnabled(): boolean {
+  const raw = process.env.PW_VSCODE_TEST_TRACE;
+  if (!raw) {
+    return false;
+  }
+  const v = raw.trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+}
+
+let harnessTraceSink: ((line: string) => void) | undefined;
+const harnessTraceBuffer: string[] = [];
+const HARNESS_TRACE_BUFFER_MAX_LINES = 2_000;
+
+function setHarnessTraceFile(filePath: string) {
+  // Lazily initialize so worker-scoped fixtures can emit trace lines early.
+  // Once the test-scoped output path exists, we flush the in-memory buffer.
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  harnessTraceSink = (line: string) => {
+    try {
+      fs.appendFileSync(filePath, line, "utf8");
+    } catch {
+      // ignore
+    }
+  };
+
+  while (harnessTraceBuffer.length) {
+    harnessTraceSink(harnessTraceBuffer.shift()!);
+  }
+}
+
+function harnessTrace(message: string) {
+  if (!isHarnessTraceEnabled()) {
+    return;
+  }
+
+  const line = `[pw-vscode-test][${new Date().toISOString()}][pid=${process.pid}] ${message}\n`;
+
+  // Always emit to stderr so CI logs capture it even if artifacts aren't uploaded.
+  try {
+    process.stderr.write(line);
+  } catch {
+    // ignore
+  }
+
+  if (harnessTraceSink) {
+    harnessTraceSink(line);
+    return;
+  }
+
+  // Buffer early lines until the test-scoped output path is known.
+  harnessTraceBuffer.push(line);
+  if (harnessTraceBuffer.length > HARNESS_TRACE_BUFFER_MAX_LINES) {
+    harnessTraceBuffer.splice(0, harnessTraceBuffer.length - HARNESS_TRACE_BUFFER_MAX_LINES);
+  }
+}
+
 // NOTE: Export `expect` from this module for convenience. We bind it to the
 // current test instance (test.expect) later.
 
@@ -282,6 +338,10 @@ export const test = base.extend<
         );
       }
 
+      harnessTrace(
+        `RPC server init: transport=${transport}, connectTimeoutMs=${wsConnectTimeoutMs}, platform=${process.platform}, node=${process.version}`
+      );
+
       if (transport === "ws") {
         const sockets = new Set<WebSocket>();
         const pending: WebSocket[] = [];
@@ -313,12 +373,18 @@ export const test = base.extend<
         }
 
         const url = `ws://127.0.0.1:${address.port}`;
+        harnessTrace(`RPC server listening (ws): ${url}`);
 
         const waitForConnection = async (): Promise<RpcTransport> => {
           const existing = pending.shift();
           if (existing) {
+            harnessTrace(`RPC waitForConnection satisfied immediately (ws); pending=${pending.length}`);
             return { kind: "ws", socket: existing };
           }
+
+          harnessTrace(
+            `RPC waitForConnection waiting (ws); pending=${pending.length}, waiters=${waiters.length}`
+          );
 
           return await new Promise<RpcTransport>((resolve, reject) => {
             let onSocket: ((socket: WebSocket) => void) | undefined;
@@ -329,6 +395,10 @@ export const test = base.extend<
                   waiters.splice(idx, 1);
                 }
               }
+
+              harnessTrace(
+                `RPC waitForConnection timed out (ws) after ${wsConnectTimeoutMs}ms; pending=${pending.length}, waiters=${waiters.length}`
+              );
               reject(
                 new Error(
                   `Timed out after ${wsConnectTimeoutMs}ms waiting for extension host connection (transport=ws, env=PW_VSCODE_TEST_WS_URL).`
@@ -338,6 +408,7 @@ export const test = base.extend<
 
             onSocket = (socket: WebSocket) => {
               clearTimeout(timeout);
+              harnessTrace(`RPC connection accepted (ws)`);
               resolve({ kind: "ws", socket });
 
               const idx = pending.indexOf(socket);
@@ -376,6 +447,14 @@ export const test = base.extend<
         sockets.add(socket);
         socket.on("close", () => sockets.delete(socket));
 
+        harnessTrace(
+          `RPC connection accepted (pipe); local=${String(
+            socket.localAddress
+          )}:${String(socket.localPort)} remote=${String(
+            socket.remoteAddress
+          )}:${String(socket.remotePort)}`
+        );
+
         const waiter = waiters.shift();
         if (waiter) {
           waiter(socket);
@@ -393,6 +472,8 @@ export const test = base.extend<
         return path.join(os.tmpdir(), name);
       })();
 
+      harnessTrace(`RPC server pipePath: ${pipePath}`);
+
       if (process.platform !== "win32") {
         // Best-effort cleanup if a previous run left the socket file behind.
         try {
@@ -408,11 +489,20 @@ export const test = base.extend<
         server.listen(pipePath);
       });
 
+      harnessTrace(`RPC server listening (pipe): ${pipePath}`);
+
       const waitForConnection = async (): Promise<RpcTransport> => {
         const existing = pending.shift();
         if (existing) {
+          harnessTrace(
+            `RPC waitForConnection satisfied immediately (pipe); pending=${pending.length}`
+          );
           return { kind: "pipe", socket: existing };
         }
+
+        harnessTrace(
+          `RPC waitForConnection waiting (pipe); pending=${pending.length}, waiters=${waiters.length}, pipePath=${pipePath}`
+        );
 
         return await new Promise<RpcTransport>((resolve, reject) => {
           let onSocket: ((socket: net.Socket) => void) | undefined;
@@ -423,6 +513,10 @@ export const test = base.extend<
                 waiters.splice(idx, 1);
               }
             }
+
+            harnessTrace(
+              `RPC waitForConnection timed out (pipe) after ${wsConnectTimeoutMs}ms; pending=${pending.length}, waiters=${waiters.length}, pipePath=${pipePath}`
+            );
             reject(
               new Error(
                 `Timed out after ${wsConnectTimeoutMs}ms waiting for extension host connection (transport=pipe, env=PW_VSCODE_TEST_PIPE_PATH).`
@@ -432,6 +526,7 @@ export const test = base.extend<
 
           onSocket = (socket: net.Socket) => {
             clearTimeout(timeout);
+            harnessTrace(`RPC waitForConnection got socket (pipe)`);
             resolve({ kind: "pipe", socket });
 
             const idx = pending.indexOf(socket);
@@ -550,6 +645,14 @@ export const test = base.extend<
     ) => {
       const { installPath, cachePath } = _vscodeInstall;
 
+      if (isHarnessTraceEnabled()) {
+        const harnessTracePath = testInfo.outputPath(
+          "pw-vscode-test-harness-trace.log"
+        );
+        setHarnessTraceFile(harnessTracePath);
+        harnessTrace(`Trace enabled; harness log: ${harnessTracePath}`);
+      }
+
       // remove all VSCODE_* environment variables, otherwise it fails to load custom webviews with the following error:
       // InvalidStateError: Failed to register a ServiceWorker: The document is in an invalid state
       const env = { ...process.env } as Record<string, string>;
@@ -565,6 +668,21 @@ export const test = base.extend<
         env.PW_VSCODE_TEST_WS_URL = _rpcServer.url;
       } else {
         env.PW_VSCODE_TEST_PIPE_PATH = _rpcServer.pipePath;
+      }
+
+      if (isHarnessTraceEnabled()) {
+        env.PW_VSCODE_TEST_TRACE = "1";
+        env.PW_VSCODE_TEST_TRACE_FILE = testInfo.outputPath(
+          "pw-vscode-test-extension-host-trace.log"
+        );
+        harnessTrace(
+          `Plumbed extension host trace file: ${env.PW_VSCODE_TEST_TRACE_FILE}`
+        );
+        harnessTrace(
+          `Launch env: transport=${env.PW_VSCODE_TEST_TRANSPORT}, wsUrl=${String(
+            env.PW_VSCODE_TEST_WS_URL
+          )}, pipePath=${String(env.PW_VSCODE_TEST_PIPE_PATH)}`
+        );
       }
 
       // NOTE: VS Code's --extensionTestsPath must point at a JS file. We rely on `npm run compile-tests`
@@ -808,7 +926,9 @@ export const test = base.extend<
     // The extension host entrypoint connects back to our worker-scoped RPC server.
     // Multiple connections are fine; for each test we use the next connection.
     void electronApp;
+    harnessTrace(`_evaluator waiting for extension host connection...`);
     const transport = await _rpcServer.waitForConnection();
+    harnessTrace(`_evaluator got extension host connection (kind=${transport.kind})`);
     // Our current Playwright build no longer exposes the private tracing hooks
     // expected by the vendored evaluator (Tracing.onBeforeCall/onAfterCall).
     // Disable this integration; VS Code traces are still collected separately.
