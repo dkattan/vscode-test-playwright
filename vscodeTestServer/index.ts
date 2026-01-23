@@ -65,6 +65,7 @@ export async function run() {
       );
     }
 
+    process.stderr.write(`VSCodeTestServer connecting (ws) to ${url}\n`);
     trace(`Connecting (ws) to ${url}`);
     const ws = new WebSocket(url);
     const rpcTransport: RpcTransport = { kind: "ws", socket: ws };
@@ -100,6 +101,8 @@ export async function run() {
       "PW_VSCODE_TEST_PIPE_PATH was not set. The Playwright harness must provide the named pipe/Unix socket path for the extension host test server to connect to when PW_VSCODE_TEST_TRANSPORT=pipe."
     );
   }
+
+  process.stderr.write(`VSCodeTestServer connecting (pipe) to ${pipePath}\n`);
 
   if (process.platform !== "win32") {
     trace(`Connecting (pipe) to ${pipePath} (exists=${fs.existsSync(pipePath)})`);

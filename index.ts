@@ -693,6 +693,14 @@ export const test = base.extend<
         "index.js"
       );
 
+      if (isHarnessTraceEnabled()) {
+        harnessTrace(
+          `Resolved extensionTestsPath=${testServerEntryPath} exists=${fs.existsSync(
+            testServerEntryPath
+          )}`
+        );
+      }
+
       const videoOptions = normalizeVideoOptions(vscodeVideo);
       const shouldRecordVideo = videoOptions.mode !== "off";
       const videoDir = testInfo.outputPath("videos");
@@ -776,6 +784,29 @@ export const test = base.extend<
           baseDir,
         ],
       });
+
+      if (isHarnessTraceEnabled()) {
+        try {
+          const proc = electronApp.process();
+          if (proc) {
+            harnessTrace(`VS Code Electron process started (pid=${proc.pid})`);
+            proc.once("exit", (code, signal) => {
+              harnessTrace(
+                `VS Code Electron process exited (code=${String(
+                  code
+                )}, signal=${String(signal)})`
+              );
+            });
+            proc.once("error", (err) => {
+              harnessTrace(`VS Code Electron process error: ${String(err)}`);
+            });
+          } else {
+            harnessTrace(`VS Code Electron process handle not available`);
+          }
+        } catch (err) {
+          harnessTrace(`Unable to attach to Electron process: ${String(err)}`);
+        }
+      }
 
       // VS Code may ignore Chromium-style --window-size. To make `windowSize` reliable,
       // resize the first BrowserWindow after launch.
